@@ -186,8 +186,20 @@ const SYNTHETIC_FIXTURES: Array<{ case: string; payload: ParsedPayload }> = [
 const liveSeenKeys = new Set<string>();
 const liveSignals: SignalRecord[] = [];
 
+export interface Env {
+  DB: D1Database;
+}
+
+interface PersonRow {
+  id: string;
+  alias: string;
+  relationship_state: string | null;
+  key_dates: string;
+  created_at: string;
+}
+
 export default {
-  async fetch(request: Request): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const headers = { 'Content-Type': 'application/json' };
 
@@ -197,8 +209,56 @@ export default {
           status: 'ok',
           service: 'relationship-journal-api',
           privacy_mode: 'pre-llm-pii-redaction-enabled',
-          endpoints: ['/health', '/ingest', '/fixtures/verify', '/mcp/tools'],
+          endpoints: ['/health', '/ingest', '/fixtures/verify', '/db/demo', '/mcp/tools'],
         }),
+        { headers }
+      );
+    }
+
+    if (url.pathname === '/db/demo') {
+      const [peopleRes, eventsRes, signalsRes] = await Promise.all([
+        env.DB.prepare(
+          'SELECT id, alias, relationship_state, key_dates, created_at FROM people ORDER BY id ASC'
+        ).all<PersonRow>(),
+        env.DB.prepare(
+          'SELECT id, person_id, summary, raw_quote, sentiment_score, occurred_at FROM timeline_events ORDER BY occurred_at ASC'
+        ).all(),
+        env.DB.prepare(
+          'SELECT id, person_id, category, content, created_at FROM signals ORDER BY created_at ASC'
+        ).all(),
+      ]);
+
+      const peopleRows = (peopleRes.results ?? []).map((row) => {
+        let parsedKeyDates: unknown = row.key_dates;
+        try {
+          parsedKeyDates = JSON.parse(row.key_dates);
+        } catch {
+          // keep raw string if unparseable
+        }
+        return { ...row, key_dates: parsedKeyDates };
+      });
+      const eventRows = eventsRes.results ?? [];
+      const signalRows = signalsRes.results ?? [];
+
+      return new Response(
+        JSON.stringify(
+          {
+            data_classification: 'SYNTHETIC_TEST_ONLY',
+            is_test_data: true,
+            counts: {
+              people: peopleRows.length,
+              timeline_events: eventRows.length,
+              signals: signalRows.length,
+            },
+            tables: {
+              people: peopleRows,
+              timeline_events: eventRows,
+              signals: signalRows,
+            },
+          },
+          null,
+          2
+        ),
         { headers }
       );
     }

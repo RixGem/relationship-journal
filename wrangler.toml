@@ -1,3 +1,8 @@
 name = "relationship-journal-api"
 main = "src/index.ts"
 compatibility_date = "2026-11-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "relationship-journal-db"
+database_id = "6e7f1172-af3b-4a8f-9edb-3e9b9ca03b34"
