@@ -20,18 +20,22 @@ Cloudflare Workers REST API backed by **Cloudflare D1 (SQLite)** and **Drizzle O
 | Method & Path | Auth | Description |
 | --- | --- | --- |
 | `GET /health` (or `/`) | Public | Minimal service liveness check |
-| `POST /ingest` | Bearer | Validates payload with Zod, runs Layer-1 PII redaction, enforces SHA-256 idempotency, routes `< 0.85` confidence / missing `person_id` to `disambiguation_queue`, rejects unknown `person_id` (`422`), and atomically persists events + bitemporal signals via `db.batch()` (`201` created, `200` deduplicated) |
+| `POST /ingest` | Bearer | Validates payload with Zod, runs Layer-1 PII redaction, enforces SHA-256 idempotency, requires explicit `confidence`, redacts `content`/`signal_topic`/`signal_value`, routes `< 0.85` confidence / missing `person_id` to `disambiguation_queue`, rejects unknown `person_id` (`422`), and atomically persists events + bitemporal signals via `db.batch()` with non-overlapping half-open valid-time intervals (`201` created, `200` deduplicated, `409` if concurrent updates to the same topic keep conflicting after retries) |
 | `GET /people/:id/timeline` | Bearer | Lists persisted timeline events for a person ordered by `occurred_at DESC` |
 | `GET /people/:id/signals` | Bearer | Lists active signals (`valid_to IS NULL`), or full bitemporal history with `?include_history=true` |
-| `GET /db/demo` | Bearer | Inspects seeded synthetic test rows across D1 tables |
-| `GET /fixtures/verify` | Bearer | Executes synthetic edge-case suite inside an isolated per-request `MemoryIngestStore` sandbox |
+| `GET /db/demo` | Bearer, dev only | Inspects seeded synthetic test rows across D1 tables |
+| `GET /fixtures/verify` | Bearer, dev only | Executes synthetic edge-case suite inside an isolated per-request `MemoryIngestStore` sandbox |
 | `GET /mcp/tools` | Bearer | Returns tool manifest aligned with implemented API routes |
+
+PII in `content`, `signal_topic` and `signal_value` is replaced with stable HMAC tokens (e.g. `[EMAIL_3f9a1c2e4b5d]`) so redacted signals stay comparable across requests. Outside development, `/ingest` returns `503` until the `PII_TOKEN_KEY` secret is set (`npx wrangler secret put PII_TOKEN_KEY`, e.g. `openssl rand -hex 32`). Rotating it changes all future tokens, so redacted topics no longer match their earlier history.
+
+`/db/demo` and `/fixtures/verify` return `404` unless `ENVIRONMENT=development` is set (e.g. in `.dev.vars`). Do not set it in production.
 
 ## Local Development & Verification
 
 ```bash
 # 1. Configure local Bearer API key (gitignored)
-echo "API_KEY=$(openssl rand -hex 32)" > .dev.vars
+printf 'API_KEY=%s\nENVIRONMENT=development\n' "$(openssl rand -hex 32)" > .dev.vars
 
 # 2. Apply versioned D1 migrations & non-destructive synthetic test seed locally
 npm run db:migrate:local
@@ -51,5 +55,6 @@ npm run dev
 ```bash
 npm run db:migrate:remote
 npx wrangler secret put API_KEY
+npx wrangler secret put PII_TOKEN_KEY
 npm run deploy
 ```

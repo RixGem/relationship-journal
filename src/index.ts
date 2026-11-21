@@ -10,9 +10,15 @@ import {
 } from './pipeline';
 import * as schema from './schema';
 
-export type RuntimeEnv = Omit<Env, 'API_KEY'> & {
+export type RuntimeEnv = Omit<Env, 'API_KEY' | 'ENVIRONMENT' | 'PII_TOKEN_KEY'> & {
   API_KEY?: string;
+  /** Diagnostic endpoints (/db/demo, /fixtures/verify) are only served when this is 'development'. */
+  ENVIRONMENT?: string;
+  /** Secret for stable PII placeholder tokens; set in production. */
+  PII_TOKEN_KEY?: string;
 };
+
+const DEV_ONLY_PATHS = new Set(['/db/demo', '/fixtures/verify']);
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
@@ -50,14 +56,26 @@ export default {
         return auth.response;
       }
 
+      if (DEV_ONLY_PATHS.has(url.pathname) && env.ENVIRONMENT !== 'development') {
+        return jsonResponse({ error: 'Not Found' }, 404);
+      }
+
       if (url.pathname === '/ingest' && request.method === 'POST') {
+        if (!env.PII_TOKEN_KEY && env.ENVIRONMENT !== 'development') {
+          return jsonResponse(
+            { error: 'Service misconfigured: PII_TOKEN_KEY secret is not set; refusing to store PII tokens.' },
+            503
+          );
+        }
         const body = await request.json().catch(() => null);
         const parsed = IngestPayloadSchema.safeParse(body);
         if (!parsed.success) {
           return jsonResponse({ error: parsed.error.flatten() }, 400);
         }
 
-        const outcome = await ingestEvent(parsed.data, new D1IngestStore(env.DB));
+        const outcome = await ingestEvent(parsed.data, new D1IngestStore(env.DB), undefined, {
+          piiTokenKey: env.PII_TOKEN_KEY,
+        });
         return jsonResponse(outcome, outcome.http_status);
       }
 

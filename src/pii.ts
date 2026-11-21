@@ -30,14 +30,27 @@ function passesLuhn(digits: string): boolean {
   return sum % 10 === 0;
 }
 
+export interface PiiRedactor {
+  redact(raw: string): string;
+  summary(): Omit<PiiRedactionResult, 'sanitized'>;
+}
+
 /**
  * Layer-1 deterministic regex + Luhn pre-filter run before storage or downstream LLM calls.
+ *
+ * A single redactor can be applied to several fields (e.g. content, signal_topic, signal_value)
+ * so identical values map to the same placeholder token across all of them.
  *
  * Scope & limitations: this is a lightweight edge pre-filter, not a statistical NER service
  * (such as Microsoft Presidio). Unstructured free-text first names without explicit markers
  * require downstream NER.
  */
-export function stripPII(raw: string): PiiRedactionResult {
+export interface PiiRedactorOptions {
+  /** Maps a detected entity to its placeholder token. Defaults to per-redactor ordinals ([EMAIL_1], ...). */
+  tokenFor?: (type: PiiEntityType, normalizedValue: string) => string;
+}
+
+export function createPiiRedactor(options: PiiRedactorOptions = {}): PiiRedactor {
   const tokenMap = new Map<string, string>();
   const typeCounters: Record<PiiEntityType, number> = {
     EMAIL: 0,
@@ -59,7 +72,7 @@ export function stripPII(raw: string): PiiRedactionResult {
     }
 
     typeCounters[type] += 1;
-    const token = `[${type}_${typeCounters[type]}]`;
+    const token = options.tokenFor ? options.tokenFor(type, normalizedValue) : `[${type}_${typeCounters[type]}]`;
     tokenMap.set(cacheKey, token);
     redactions.push({ type, token });
 
@@ -71,68 +84,117 @@ export function stripPII(raw: string): PiiRedactionResult {
     return token;
   };
 
-  let text = raw;
+  const redact = (raw: string): string => {
+    let text = raw;
 
-  // 1. Email addresses
-  text = text.replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, (match) =>
-    getToken('EMAIL', match.toLowerCase())
-  );
+    // 1. Email addresses
+    text = text.replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, (match) =>
+      getToken('EMAIL', match.toLowerCase())
+    );
 
-  // 2. Payment cards (13-19 digits, Luhn-verified, bounded so UUIDs/IDs are not matched)
-  text = text.replace(/(?<![\w-])\d(?:[ -]?\d){12,18}(?![\w-])/g, (match) => {
-    const digits = match.replace(/\D/g, '');
-    if (!passesLuhn(digits)) {
-      return match;
-    }
-    return getToken('CARD', digits);
-  });
-
-  // 3. US SSN (strict 3-2-4 format)
-  text = text.replace(/(?<![\w-])\d{3}-\d{2}-\d{4}(?![\w-])/g, (match) =>
-    getToken('SSN', match)
-  );
-
-  // 4a. International E.164 phone numbers (require leading '+' and 9-15 digits)
-  text = text.replace(
-    /(?<![\w+])\+[1-9]\d{0,2}[-.\s]?(?:\(?\d{1,4}\)?[-.\s]?){2,4}\d{2,4}(?![\w-])/g,
-    (match) => {
+    // 2. Payment cards (13-19 digits, Luhn-verified, bounded so UUIDs/IDs are not matched)
+    text = text.replace(/(?<![\w-])\d(?:[ -]?\d){12,18}(?![\w-])/g, (match) => {
       const digits = match.replace(/\D/g, '');
-      if (digits.length < 9 || digits.length > 15) {
+      if (!passesLuhn(digits)) {
         return match;
       }
-      return getToken('PHONE', digits);
-    }
-  );
+      return getToken('CARD', digits);
+    });
 
-  // 4b. US/NANP 10-digit phone numbers (avoids ISO dates YYYY-MM-DD and short numbers)
-  text = text.replace(
-    /(?<![\w-])(?:\(\d{3}\)\s?|\d{3}[-.\s])\d{3}[-.\s]\d{4}(?![\w-])/g,
-    (match) => getToken('PHONE', match.replace(/\D/g, ''))
-  );
+    // 3. US SSN (strict 3-2-4 format)
+    text = text.replace(/(?<![\w-])\d{3}-\d{2}-\d{4}(?![\w-])/g, (match) => getToken('SSN', match));
 
-  // 4c. Mainland China 11-digit mobile numbers (1[3-9]xxxxxxxxx)
-  text = text.replace(/(?<![\w-])1[3-9]\d(?:[-.\s]?\d{4}){2}(?![\w-])/g, (match) =>
-    getToken('PHONE', match.replace(/\D/g, ''))
-  );
+    // 4a. International E.164 phone numbers (require leading '+' and 9-15 digits)
+    text = text.replace(
+      /(?<![\w+])\+[1-9]\d{0,2}[-.\s]?(?:\(?\d{1,4}\)?[-.\s]?){2,4}\d{2,4}(?![\w-])/g,
+      (match) => {
+        const digits = match.replace(/\D/g, '');
+        if (digits.length < 9 || digits.length > 15) {
+          return match;
+        }
+        return getToken('PHONE', digits);
+      }
+    );
 
-  // 5. Explicit @handles (after email replacement)
-  text = text.replace(/(?<![\w.])@[a-zA-Z0-9_]{3,32}\b/g, (match) =>
-    getToken('HANDLE', match.toLowerCase())
-  );
+    // 4b. US/NANP 10-digit phone numbers (avoids ISO dates YYYY-MM-DD and short numbers)
+    text = text.replace(
+      /(?<![\w-])(?:\(\d{3}\)\s?|\d{3}[-.\s])\d{3}[-.\s]\d{4}(?![\w-])/g,
+      (match) => getToken('PHONE', match.replace(/\D/g, ''))
+    );
 
-  // 6. Explicit name declarations (e.g., "Name: Alice Smith", "My name is Bob")
-  text = text.replace(
-    /\b(?:[Nn]ame|[Ff]ull [Nn]ame|[Cc]ontact|[Mm]y name is)(\s*[:\-]?\s+)([A-Z][a-z]{1,24}(?:\s+[A-Z][a-z]{1,24}){0,2})\b/g,
-    (fullMatch, sep: string, namePart: string) => {
-      const prefix = fullMatch.slice(0, fullMatch.length - sep.length - namePart.length);
-      const token = getToken('PERSON', namePart.toLowerCase());
-      return `${prefix}${sep}${token}`;
-    }
-  );
+    // 4c. Mainland China 11-digit mobile numbers (1[3-9]xxxxxxxxx)
+    text = text.replace(/(?<![\w-])1[3-9]\d(?:[-.\s]?\d{4}){2}(?![\w-])/g, (match) =>
+      getToken('PHONE', match.replace(/\D/g, ''))
+    );
+
+    // 5. Explicit @handles (after email replacement)
+    text = text.replace(/(?<![\w.])@[a-zA-Z0-9_]{3,32}\b/g, (match) =>
+      getToken('HANDLE', match.toLowerCase())
+    );
+
+    // 6. Explicit name declarations (e.g., "Name: Alice Smith", "My name is Bob")
+    text = text.replace(
+      /\b(?:[Nn]ame|[Ff]ull [Nn]ame|[Cc]ontact|[Mm]y name is)(\s*[:\-]?\s+)([A-Z][a-z]{1,24}(?:\s+[A-Z][a-z]{1,24}){0,2})\b/g,
+      (fullMatch, sep: string, namePart: string) => {
+        const prefix = fullMatch.slice(0, fullMatch.length - sep.length - namePart.length);
+        const token = getToken('PERSON', namePart.toLowerCase());
+        return `${prefix}${sep}${token}`;
+      }
+    );
+
+    return text;
+  };
 
   return {
-    sanitized: text,
-    redacted_entities: redactedEntities,
-    redactions,
+    redact,
+    summary: () => ({
+      redacted_entities: [...redactedEntities],
+      redactions: [...redactions],
+    }),
   };
+}
+
+const DEFAULT_PII_TOKEN_KEY = 'relationship-journal-pii-token-v1';
+
+/**
+ * Builds a redactor whose tokens are stable across requests: `[TYPE_<hmac-sha256 prefix>]`
+ * keyed by `key`. Use this for values that are compared across requests (signal topics and
+ * values), where per-request ordinals would make different entities look identical.
+ * The fallback key is public and only for development/tests: with it, tokens of low-entropy
+ * values (phone numbers, SSNs) can be brute-forced. The Worker refuses /ingest outside
+ * development unless PII_TOKEN_KEY is set.
+ */
+export async function createStablePiiRedactor(texts: string[], key?: string): Promise<PiiRedactor> {
+  const entities = new Map<string, { type: PiiEntityType }>();
+  const collector = createPiiRedactor({
+    tokenFor: (type, normalized) => {
+      entities.set(`${type}:${normalized}`, { type });
+      return `[${type}]`;
+    },
+  });
+  for (const text of texts) collector.redact(text);
+
+  const hmacKey = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(key || DEFAULT_PII_TOKEN_KEY),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const tokens = new Map<string, string>();
+  for (const [cacheKey, { type }] of entities) {
+    const mac = await crypto.subtle.sign('HMAC', hmacKey, new TextEncoder().encode(cacheKey));
+    const hex = [...new Uint8Array(mac)].map((b) => b.toString(16).padStart(2, '0')).join('');
+    tokens.set(cacheKey, `[${type}_${hex.slice(0, 12)}]`);
+  }
+
+  return createPiiRedactor({
+    tokenFor: (type, normalized) => tokens.get(`${type}:${normalized}`) ?? `[${type}]`,
+  });
+}
+
+export function stripPII(raw: string): PiiRedactionResult {
+  const redactor = createPiiRedactor();
+  const sanitized = redactor.redact(raw);
+  return { sanitized, ...redactor.summary() };
 }
