@@ -10,9 +10,13 @@ import {
 } from './pipeline';
 import * as schema from './schema';
 
-export type RuntimeEnv = Omit<Env, 'API_KEY'> & {
+export type RuntimeEnv = Omit<Env, 'API_KEY' | 'ENVIRONMENT'> & {
   API_KEY?: string;
+  /** Diagnostic endpoints (/db/demo, /fixtures/verify) are only served when this is 'development'. */
+  ENVIRONMENT?: string;
 };
+
+const DEV_ONLY_PATHS = new Set(['/db/demo', '/fixtures/verify']);
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
@@ -48,6 +52,10 @@ export default {
       const auth = await requireBearerAuth(request, env);
       if (!auth.ok) {
         return auth.response;
+      }
+
+      if (DEV_ONLY_PATHS.has(url.pathname) && env.ENVIRONMENT !== 'development') {
+        return jsonResponse({ error: 'Not Found' }, 404);
       }
 
       if (url.pathname === '/ingest' && request.method === 'POST') {

@@ -19,6 +19,7 @@ export default defineConfig(async () => {
           bindings: {
             TEST_MIGRATIONS: migrations,
             API_KEY: 'test-api-key-for-vitest-only',
+            ENVIRONMENT: 'development',
           },
         },
       }),

@@ -1,12 +1,12 @@
 import { z } from 'zod';
-import { stripPII, type PiiEntityType } from './pii';
+import { createPiiRedactor, type PiiEntityType } from './pii';
 
 export const IngestPayloadSchema = z
   .object({
     person_id: z.string().min(1).nullable().default(null),
     source: z.enum(['voice_note', 'chat_log', 'manual']).default('manual'),
     content: z.string().min(1).max(10000),
-    confidence: z.number().min(0).max(1).default(0.95),
+    confidence: z.number().min(0).max(1),
     sentiment_score: z.number().min(-1).max(1).optional(),
     signal_topic: z.string().min(1).max(128).optional(),
     signal_value: z.string().min(1).max(512).optional(),
@@ -81,6 +81,13 @@ export type BitemporalUpdate =
       value: string;
     }
   | {
+      action: 'unchanged_historical_signal';
+      historical_signal_id: string;
+      value: string;
+      valid_from: string;
+      valid_to: string;
+    }
+  | {
       action: 'superseded_conflicting_signal';
       deprecated_signal_id: string;
       old_value: string;
@@ -94,8 +101,10 @@ export type BitemporalUpdate =
       value: string;
       valid_from: string;
       valid_to: string;
-      active_signal_id: string;
-      active_value: string;
+      next_signal_id: string | null;
+      truncated_signal_id: string | null;
+      active_signal_id: string | null;
+      active_value: string | null;
     };
 
 export type IngestOutcome =
@@ -123,6 +132,12 @@ export type IngestOutcome =
       person_id: string;
     }
   | {
+      status: 'conflict';
+      http_status: 409;
+      idempotency_key: string;
+      error: string;
+    }
+  | {
       status: 'persisted';
       http_status: 201;
       event_id: string;
@@ -138,38 +153,66 @@ export interface IdempotencyRecord {
   response_json: string;
 }
 
+/**
+ * Narrows an existing signal's valid-time interval. `expectedValidTo` is an optimistic
+ * concurrency guard: the update only applies if the row still has the interval we planned against.
+ */
+export interface SignalCloseOp {
+  id: string;
+  expectedValidTo: string | null;
+  validTo: string;
+  supersededAt: string;
+  supersededBy: string;
+}
+
 export type SignalMutation =
   | { kind: 'none' }
-  | { kind: 'insert'; signal: SignalRecord }
-  | {
-      kind: 'supersede';
-      deprecatedId: string;
-      validTo: string;
-      supersededAt: string;
-      newSignal: SignalRecord;
-    };
+  | { kind: 'write'; close: SignalCloseOp | null; insert: SignalRecord };
+
+export interface CommitResult {
+  deduplicated: boolean;
+  existing?: IdempotencyRecord | null;
+  /** True when a concurrent write to the same (person_id, topic) invalidated the plan. */
+  conflict?: boolean;
+}
 
 export interface IngestStore {
   getIdempotency(key: string): Promise<IdempotencyRecord | null>;
   personExists(personId: string): Promise<boolean>;
-  getActiveSignal(personId: string, topic: string): Promise<SignalRecord | null>;
+  getSignalHistory(personId: string, topic: string): Promise<SignalRecord[]>;
   commitDisambiguation(
     entry: DisambiguationInsert,
     idempotency: IdempotencyRecord,
     createdAt: string
-  ): Promise<{ deduplicated: boolean; existing?: IdempotencyRecord | null }>;
+  ): Promise<CommitResult>;
   commitIngestion(params: {
     event: TimelineEventInsert;
     signalMutation: SignalMutation;
     idempotency: IdempotencyRecord;
     createdAt: string;
-  }): Promise<{ deduplicated: boolean; existing?: IdempotencyRecord | null }>;
+  }): Promise<CommitResult>;
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 function isUniqueConstraintError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /UNIQUE constraint failed|SQLITE_CONSTRAINT/i.test(msg);
+  return /UNIQUE constraint failed|SQLITE_CONSTRAINT/i.test(errorMessage(err));
 }
+
+/**
+ * Signal write conflicts: the one-active-per-topic partial unique index, or the
+ * valid-time overlap / interval triggers from migrations/0002_signal_valid_time_guards.sql.
+ */
+function isSignalConflictError(err: unknown): boolean {
+  return /signal_valid_time_overlap|signal_invalid_interval|UNIQUE constraint failed: signals\./i.test(
+    errorMessage(err)
+  );
+}
+
+const SIGNAL_COLUMNS =
+  'id, person_id, category, topic, value, content, valid_from, valid_to, recorded_at, superseded_at, superseded_by';
 
 /**
  * Production Cloudflare D1 backing store using atomic `db.batch()` transactions.
@@ -193,21 +236,21 @@ export class D1IngestStore implements IngestStore {
     return row !== null;
   }
 
-  async getActiveSignal(personId: string, topic: string): Promise<SignalRecord | null> {
-    const row = await this.db
+  async getSignalHistory(personId: string, topic: string): Promise<SignalRecord[]> {
+    const res = await this.db
       .prepare(
-        'SELECT id, person_id, category, topic, value, content, valid_from, valid_to, recorded_at, superseded_at, superseded_by FROM signals WHERE person_id = ? AND topic = ? AND valid_to IS NULL LIMIT 1'
+        `SELECT ${SIGNAL_COLUMNS} FROM signals WHERE person_id = ? AND topic = ? ORDER BY julianday(valid_from) ASC`
       )
       .bind(personId, topic)
-      .first<SignalRecord>();
-    return row ?? null;
+      .all<SignalRecord>();
+    return res.results ?? [];
   }
 
   async commitDisambiguation(
     entry: DisambiguationInsert,
     idempotency: IdempotencyRecord,
     createdAt: string
-  ): Promise<{ deduplicated: boolean; existing?: IdempotencyRecord | null }> {
+  ): Promise<CommitResult> {
     const insertQueue = this.db
       .prepare(
         'INSERT INTO disambiguation_queue (id, idempotency_key, source, sanitized_content, redacted_entities, confidence, signal_topic, signal_value, signal_category, occurred_at, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
@@ -250,7 +293,7 @@ export class D1IngestStore implements IngestStore {
     signalMutation: SignalMutation;
     idempotency: IdempotencyRecord;
     createdAt: string;
-  }): Promise<{ deduplicated: boolean; existing?: IdempotencyRecord | null }> {
+  }): Promise<CommitResult> {
     const { event, signalMutation, idempotency, createdAt } = params;
     const statements: D1PreparedStatement[] = [
       this.db
@@ -271,56 +314,32 @@ export class D1IngestStore implements IngestStore {
         ),
     ];
 
-    if (signalMutation.kind === 'supersede') {
+    if (signalMutation.kind === 'write') {
+      const { close, insert } = signalMutation;
+      if (close) {
+        statements.push(
+          this.db
+            .prepare(
+              'UPDATE signals SET valid_to = ?, superseded_at = ?, superseded_by = ? WHERE id = ? AND valid_to IS ?'
+            )
+            .bind(close.validTo, close.supersededAt, close.supersededBy, close.id, close.expectedValidTo)
+        );
+      }
       statements.push(
         this.db
-          .prepare(
-            'UPDATE signals SET valid_to = ?, superseded_at = ?, superseded_by = ? WHERE id = ? AND valid_to IS NULL'
-          )
+          .prepare(`INSERT INTO signals (${SIGNAL_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
           .bind(
-            signalMutation.validTo,
-            signalMutation.supersededAt,
-            signalMutation.newSignal.id,
-            signalMutation.deprecatedId
-          )
-      );
-      statements.push(
-        this.db
-          .prepare(
-            'INSERT INTO signals (id, person_id, category, topic, value, content, valid_from, valid_to, recorded_at, superseded_at, superseded_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-          )
-          .bind(
-            signalMutation.newSignal.id,
-            signalMutation.newSignal.person_id,
-            signalMutation.newSignal.category,
-            signalMutation.newSignal.topic,
-            signalMutation.newSignal.value,
-            signalMutation.newSignal.content,
-            signalMutation.newSignal.valid_from,
-            signalMutation.newSignal.valid_to,
-            signalMutation.newSignal.recorded_at,
-            signalMutation.newSignal.superseded_at,
-            signalMutation.newSignal.superseded_by
-          )
-      );
-    } else if (signalMutation.kind === 'insert') {
-      statements.push(
-        this.db
-          .prepare(
-            'INSERT INTO signals (id, person_id, category, topic, value, content, valid_from, valid_to, recorded_at, superseded_at, superseded_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-          )
-          .bind(
-            signalMutation.signal.id,
-            signalMutation.signal.person_id,
-            signalMutation.signal.category,
-            signalMutation.signal.topic,
-            signalMutation.signal.value,
-            signalMutation.signal.content,
-            signalMutation.signal.valid_from,
-            signalMutation.signal.valid_to,
-            signalMutation.signal.recorded_at,
-            signalMutation.signal.superseded_at,
-            signalMutation.signal.superseded_by
+            insert.id,
+            insert.person_id,
+            insert.category,
+            insert.topic,
+            insert.value,
+            insert.content,
+            insert.valid_from,
+            insert.valid_to,
+            insert.recorded_at,
+            insert.superseded_at,
+            insert.superseded_by
           )
       );
     }
@@ -335,20 +354,41 @@ export class D1IngestStore implements IngestStore {
       await this.db.batch(statements);
       return { deduplicated: false };
     } catch (err) {
-      if (isUniqueConstraintError(err)) {
+      if (isUniqueConstraintError(err) || isSignalConflictError(err)) {
         const existing = await this.getIdempotency(idempotency.key);
         if (existing) {
           return { deduplicated: true, existing };
         }
+      }
+      if (isSignalConflictError(err)) {
+        return { deduplicated: false, conflict: true };
       }
       throw err;
     }
   }
 }
 
+function intervalEnd(s: { valid_to: string | null }): number {
+  return s.valid_to === null ? Number.POSITIVE_INFINITY : Date.parse(s.valid_to);
+}
+
+function intervalsOverlap(
+  a: { valid_from: string; valid_to: string | null },
+  b: { valid_from: string; valid_to: string | null }
+): boolean {
+  const aStart = Date.parse(a.valid_from);
+  const bStart = Date.parse(b.valid_from);
+  const aEnd = intervalEnd(a);
+  const bEnd = intervalEnd(b);
+  // Half-open [from, to) intervals; zero-length intervals never overlap anything.
+  if (aEnd <= aStart || bEnd <= bStart) return false;
+  return aStart < bEnd && bStart < aEnd;
+}
+
 /**
  * Isolated, per-request in-memory store used exclusively by `/fixtures/verify`
  * so synthetic test verification never mutates production D1 tables.
+ * Mirrors the D1 constraints (one active row per topic, no valid-time overlap).
  */
 export class MemoryIngestStore implements IngestStore {
   readonly peopleIds: Set<string>;
@@ -369,17 +409,17 @@ export class MemoryIngestStore implements IngestStore {
     return this.peopleIds.has(personId);
   }
 
-  async getActiveSignal(personId: string, topic: string): Promise<SignalRecord | null> {
-    return (
-      this.signals.find((s) => s.person_id === personId && s.topic === topic && s.valid_to === null) ??
-      null
-    );
+  async getSignalHistory(personId: string, topic: string): Promise<SignalRecord[]> {
+    return this.signals
+      .filter((s) => s.person_id === personId && s.topic === topic)
+      .sort((a, b) => Date.parse(a.valid_from) - Date.parse(b.valid_from))
+      .map((s) => ({ ...s }));
   }
 
   async commitDisambiguation(
     entry: DisambiguationInsert,
     idempotency: IdempotencyRecord
-  ): Promise<{ deduplicated: boolean; existing?: IdempotencyRecord | null }> {
+  ): Promise<CommitResult> {
     const existing = this.idempotencyMap.get(idempotency.key);
     if (existing) {
       return { deduplicated: true, existing };
@@ -393,28 +433,37 @@ export class MemoryIngestStore implements IngestStore {
     event: TimelineEventInsert;
     signalMutation: SignalMutation;
     idempotency: IdempotencyRecord;
-  }): Promise<{ deduplicated: boolean; existing?: IdempotencyRecord | null }> {
+  }): Promise<CommitResult> {
     const existing = this.idempotencyMap.get(params.idempotency.key);
     if (existing) {
       return { deduplicated: true, existing };
     }
 
-    this.events.push(params.event);
-    if (params.signalMutation.kind === 'supersede') {
-      const mutation = params.signalMutation;
-      const target = this.signals.find(
-        (s) => s.id === mutation.deprecatedId && s.valid_to === null
-      );
-      if (target) {
-        target.valid_to = mutation.validTo;
-        target.superseded_at = mutation.supersededAt;
-        target.superseded_by = mutation.newSignal.id;
+    if (params.signalMutation.kind === 'write') {
+      const { close, insert } = params.signalMutation;
+      const target = close
+        ? this.signals.find((s) => s.id === close.id && s.valid_to === close.expectedValidTo)
+        : undefined;
+      const closedTarget = target && close ? { ...target, valid_to: close.validTo } : undefined;
+      const siblings = this.signals
+        .filter((s) => s.person_id === insert.person_id && s.topic === insert.topic)
+        .map((s) => (closedTarget && s.id === closedTarget.id ? closedTarget : s));
+
+      const activeConflict =
+        insert.valid_to === null && siblings.some((s) => s.valid_to === null);
+      if (activeConflict || siblings.some((s) => intervalsOverlap(s, insert))) {
+        return { deduplicated: false, conflict: true };
       }
-      this.signals.push(mutation.newSignal);
-    } else if (params.signalMutation.kind === 'insert') {
-      this.signals.push(params.signalMutation.signal);
+
+      if (target && close) {
+        target.valid_to = close.validTo;
+        target.superseded_at = close.supersededAt;
+        target.superseded_by = close.supersededBy;
+      }
+      this.signals.push(insert);
     }
 
+    this.events.push(params.event);
     this.idempotencyMap.set(params.idempotency.key, params.idempotency);
     return { deduplicated: false };
   }
@@ -456,6 +505,128 @@ function summarizeSanitizedContent(sanitized: string): string {
   return sanitized.length > 140 ? `${sanitized.slice(0, 137)}...` : sanitized;
 }
 
+const MAX_COMMIT_ATTEMPTS = 4;
+
+/**
+ * Plans a valid-time write for one (person_id, topic) so that intervals never overlap.
+ * Intervals are half-open [valid_from, valid_to); the result of ingesting a set of
+ * observations is independent of the order in which they arrive.
+ */
+export function planSignalWrite(params: {
+  history: SignalRecord[];
+  personId: string;
+  topic: string;
+  value: string;
+  category: string;
+  content: string;
+  occurredAt: string;
+  recordedAt: string;
+  newSignalId: string;
+}): { update: BitemporalUpdate; mutation: SignalMutation } {
+  const { personId, topic, value, category, content, occurredAt, recordedAt, newSignalId } = params;
+  const t = Date.parse(occurredAt);
+  const history = [...params.history].sort((a, b) => Date.parse(a.valid_from) - Date.parse(b.valid_from));
+  const active = history.find((s) => s.valid_to === null) ?? null;
+  const containing = history.find((s) => Date.parse(s.valid_from) <= t && t < intervalEnd(s)) ?? null;
+
+  const newRecord = (validTo: string | null, supersededBy: string | null): SignalRecord => ({
+    id: newSignalId,
+    person_id: personId,
+    category,
+    topic,
+    value,
+    content,
+    valid_from: occurredAt,
+    valid_to: validTo,
+    recorded_at: recordedAt,
+    superseded_at: supersededBy ? recordedAt : null,
+    superseded_by: supersededBy,
+  });
+
+  if (!containing) {
+    // Earlier than every known interval (or in a gap): fill up to the next interval's start.
+    const next = history.find((s) => Date.parse(s.valid_from) > t) ?? null;
+    if (!next) {
+      return {
+        update: { action: 'created_signal', new_signal_id: newSignalId, value, valid_from: occurredAt },
+        mutation: { kind: 'write', close: null, insert: newRecord(null, null) },
+      };
+    }
+    return {
+      update: {
+        action: 'recorded_historical_signal',
+        historical_signal_id: newSignalId,
+        value,
+        valid_from: occurredAt,
+        valid_to: next.valid_from,
+        next_signal_id: next.id,
+        truncated_signal_id: null,
+        active_signal_id: active?.id ?? null,
+        active_value: active?.value ?? null,
+      },
+      mutation: { kind: 'write', close: null, insert: newRecord(next.valid_from, next.id) },
+    };
+  }
+
+  if (containing.value === value) {
+    if (containing.valid_to === null) {
+      return {
+        update: { action: 'unchanged_existing_signal', active_signal_id: containing.id, value },
+        mutation: { kind: 'none' },
+      };
+    }
+    return {
+      update: {
+        action: 'unchanged_historical_signal',
+        historical_signal_id: containing.id,
+        value,
+        valid_from: containing.valid_from,
+        valid_to: containing.valid_to,
+      },
+      mutation: { kind: 'none' },
+    };
+  }
+
+  const close: SignalCloseOp = {
+    id: containing.id,
+    expectedValidTo: containing.valid_to,
+    validTo: occurredAt,
+    supersededAt: recordedAt,
+    supersededBy: newSignalId,
+  };
+
+  if (containing.valid_to === null) {
+    // Newer conflicting observation: close the active interval at t and open a new one.
+    return {
+      update: {
+        action: 'superseded_conflicting_signal',
+        deprecated_signal_id: containing.id,
+        old_value: containing.value,
+        new_signal_id: newSignalId,
+        new_value: value,
+        valid_from: occurredAt,
+      },
+      mutation: { kind: 'write', close, insert: newRecord(null, null) },
+    };
+  }
+
+  // Late observation inside a closed interval: split it into [from, t) and [t, to).
+  return {
+    update: {
+      action: 'recorded_historical_signal',
+      historical_signal_id: newSignalId,
+      value,
+      valid_from: occurredAt,
+      valid_to: containing.valid_to,
+      next_signal_id: containing.superseded_by,
+      truncated_signal_id: containing.id,
+      active_signal_id: active?.id ?? null,
+      active_value: active?.value ?? null,
+    },
+    mutation: { kind: 'write', close, insert: newRecord(containing.valid_to, containing.superseded_by) },
+  };
+}
+
 export async function ingestEvent(
   payload: ParsedIngestPayload,
   store: IngestStore,
@@ -470,7 +641,13 @@ export async function ingestEvent(
 
   const recordedAt = nowIso ?? new Date().toISOString();
   const occurredAt = payload.occurred_at ? new Date(payload.occurred_at).toISOString() : recordedAt;
-  const { sanitized, redacted_entities } = stripPII(payload.content);
+
+  // One redactor across all free-text fields so placeholder tokens stay consistent.
+  const redactor = createPiiRedactor();
+  const sanitized = redactor.redact(payload.content);
+  const signalTopic = payload.signal_topic !== undefined ? redactor.redact(payload.signal_topic) : undefined;
+  const signalValue = payload.signal_value !== undefined ? redactor.redact(payload.signal_value) : undefined;
+  const { redacted_entities } = redactor.summary();
 
   // Ambiguous or low-confidence event -> isolate in disambiguation_queue
   if (!payload.person_id || payload.confidence < 0.85) {
@@ -495,9 +672,9 @@ export async function ingestEvent(
         sanitized_content: sanitized,
         redacted_entities,
         confidence: payload.confidence,
-        signal_topic: payload.signal_topic ?? null,
-        signal_value: payload.signal_value ?? null,
-        signal_category: payload.signal_topic ? payload.signal_category : null,
+        signal_topic: signalTopic ?? null,
+        signal_value: signalValue ?? null,
+        signal_category: signalTopic ? payload.signal_category : null,
         occurred_at: occurredAt,
         created_at: recordedAt,
       },
@@ -527,141 +704,74 @@ export async function ingestEvent(
     };
   }
 
-  const eventId = `evt_${crypto.randomUUID()}`;
-  let bitemporalUpdate: BitemporalUpdate | null = null;
-  let signalMutation: SignalMutation = { kind: 'none' };
+  for (let attempt = 1; attempt <= MAX_COMMIT_ATTEMPTS; attempt++) {
+    const eventId = `evt_${crypto.randomUUID()}`;
+    let bitemporalUpdate: BitemporalUpdate | null = null;
+    let signalMutation: SignalMutation = { kind: 'none' };
 
-  if (payload.signal_topic && payload.signal_value) {
-    const active = await store.getActiveSignal(payload.person_id, payload.signal_topic);
-    const newSignalId = `sig_${crypto.randomUUID()}`;
-    const signalContent = `${payload.signal_topic}: ${payload.signal_value}`;
-
-    if (!active) {
-      bitemporalUpdate = {
-        action: 'created_signal',
-        new_signal_id: newSignalId,
-        value: payload.signal_value,
-        valid_from: occurredAt,
-      };
-      signalMutation = {
-        kind: 'insert',
-        signal: {
-          id: newSignalId,
-          person_id: payload.person_id,
-          category: payload.signal_category,
-          topic: payload.signal_topic,
-          value: payload.signal_value,
-          content: signalContent,
-          valid_from: occurredAt,
-          valid_to: null,
-          recorded_at: recordedAt,
-          superseded_at: null,
-          superseded_by: null,
-        },
-      };
-    } else if (active.value === payload.signal_value) {
-      // Idempotent / same-value re-assertion: preserve existing active signal without duplicating
-      bitemporalUpdate = {
-        action: 'unchanged_existing_signal',
-        active_signal_id: active.id,
-        value: active.value,
-      };
-    } else if (Date.parse(occurredAt) < Date.parse(active.valid_from)) {
-      // Out-of-order late-arriving historical event: record closed past interval without clobbering newer active value
-      bitemporalUpdate = {
-        action: 'recorded_historical_signal',
-        historical_signal_id: newSignalId,
-        value: payload.signal_value,
-        valid_from: occurredAt,
-        valid_to: active.valid_from,
-        active_signal_id: active.id,
-        active_value: active.value,
-      };
-      signalMutation = {
-        kind: 'insert',
-        signal: {
-          id: newSignalId,
-          person_id: payload.person_id,
-          category: payload.signal_category,
-          topic: payload.signal_topic,
-          value: payload.signal_value,
-          content: signalContent,
-          valid_from: occurredAt,
-          valid_to: active.valid_from,
-          recorded_at: recordedAt,
-          superseded_at: recordedAt,
-          superseded_by: active.id,
-        },
-      };
-    } else {
-      // Conflicting newer or concurrent observation: close prior active signal and insert replacement
-      bitemporalUpdate = {
-        action: 'superseded_conflicting_signal',
-        deprecated_signal_id: active.id,
-        old_value: active.value,
-        new_signal_id: newSignalId,
-        new_value: payload.signal_value,
-        valid_from: occurredAt,
-      };
-      signalMutation = {
-        kind: 'supersede',
-        deprecatedId: active.id,
-        validTo: occurredAt,
-        supersededAt: recordedAt,
-        newSignal: {
-          id: newSignalId,
-          person_id: payload.person_id,
-          category: payload.signal_category,
-          topic: payload.signal_topic,
-          value: payload.signal_value,
-          content: signalContent,
-          valid_from: occurredAt,
-          valid_to: null,
-          recorded_at: recordedAt,
-          superseded_at: null,
-          superseded_by: null,
-        },
-      };
+    if (signalTopic && signalValue) {
+      const plan = planSignalWrite({
+        history: await store.getSignalHistory(payload.person_id, signalTopic),
+        personId: payload.person_id,
+        topic: signalTopic,
+        value: signalValue,
+        category: payload.signal_category,
+        content: `${signalTopic}: ${signalValue}`,
+        occurredAt,
+        recordedAt,
+        newSignalId: `sig_${crypto.randomUUID()}`,
+      });
+      bitemporalUpdate = plan.update;
+      signalMutation = plan.mutation;
     }
-  }
 
-  const outcome: IngestOutcome = {
-    status: 'persisted',
-    http_status: 201,
-    event_id: eventId,
-    idempotency_key: idempotencyKey,
-    sanitized_content: sanitized,
-    redacted_entities,
-    bitemporal_update: bitemporalUpdate,
-  };
-
-  const commitRes = await store.commitIngestion({
-    event: {
-      id: eventId,
-      person_id: payload.person_id,
-      source: payload.source,
-      summary: summarizeSanitizedContent(sanitized),
-      raw_quote: sanitized,
-      redacted_entities,
-      sentiment_score: payload.sentiment_score ?? null,
+    const outcome: IngestOutcome = {
+      status: 'persisted',
+      http_status: 201,
+      event_id: eventId,
       idempotency_key: idempotencyKey,
-      occurred_at: occurredAt,
-      recorded_at: recordedAt,
-    },
-    signalMutation,
-    idempotency: {
-      key: idempotencyKey,
-      status: outcome.status,
-      response_json: JSON.stringify(outcome),
-    },
-    createdAt: recordedAt,
-  });
+      sanitized_content: sanitized,
+      redacted_entities,
+      bitemporal_update: bitemporalUpdate,
+    };
 
-  if (commitRes.deduplicated && commitRes.existing) {
-    return buildDeduplicatedOutcome(idempotencyKey, commitRes.existing);
+    const commitRes = await store.commitIngestion({
+      event: {
+        id: eventId,
+        person_id: payload.person_id,
+        source: payload.source,
+        summary: summarizeSanitizedContent(sanitized),
+        raw_quote: sanitized,
+        redacted_entities,
+        sentiment_score: payload.sentiment_score ?? null,
+        idempotency_key: idempotencyKey,
+        occurred_at: occurredAt,
+        recorded_at: recordedAt,
+      },
+      signalMutation,
+      idempotency: {
+        key: idempotencyKey,
+        status: outcome.status,
+        response_json: JSON.stringify(outcome),
+      },
+      createdAt: recordedAt,
+    });
+
+    if (commitRes.deduplicated && commitRes.existing) {
+      return buildDeduplicatedOutcome(idempotencyKey, commitRes.existing);
+    }
+    if (!commitRes.conflict) {
+      return outcome;
+    }
+    // A concurrent write changed this topic's history; re-read and re-plan.
   }
 
-  return outcome;
+  return {
+    status: 'conflict',
+    http_status: 409,
+    idempotency_key: idempotencyKey,
+    error: 'Concurrent updates to the same signal topic; retry the request.',
+  };
 }
 
 export const SYNTHETIC_FIXTURES: Array<{ case: string; payload: ParsedIngestPayload }> = [

@@ -1,5 +1,7 @@
 import { SELF, env } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
+import worker from '../src/index';
+import { MemoryIngestStore, ingestEvent, type ParsedIngestPayload } from '../src/pipeline';
 
 const PERSON_ID = '00000000-0000-4000-8000-000000000101';
 
@@ -9,6 +11,56 @@ function authHeaders(extra: Record<string, string> = {}): Record<string, string>
     'Content-Type': 'application/json',
     ...extra,
   };
+}
+
+interface SignalRow {
+  id?: string;
+  value: string;
+  valid_from: string;
+  valid_to: string | null;
+}
+
+function intervalEnd(row: SignalRow): number {
+  return row.valid_to === null ? Number.POSITIVE_INFINITY : Date.parse(row.valid_to);
+}
+
+function expectNoOverlap(rows: SignalRow[]): void {
+  const live = rows.filter((r) => intervalEnd(r) > Date.parse(r.valid_from));
+  for (let i = 0; i < live.length; i++) {
+    for (let j = i + 1; j < live.length; j++) {
+      const a = live[i];
+      const b = live[j];
+      const overlaps = Date.parse(a.valid_from) < intervalEnd(b) && Date.parse(b.valid_from) < intervalEnd(a);
+      expect(overlaps, `${JSON.stringify(a)} overlaps ${JSON.stringify(b)}`).toBe(false);
+    }
+  }
+  expect(rows.filter((r) => r.valid_to === null).length).toBeLessThanOrEqual(1);
+}
+
+function ingest(body: Record<string, unknown>): Promise<Response> {
+  return SELF.fetch('https://example.com/ingest', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({ person_id: PERSON_ID, source: 'manual', confidence: 0.95, ...body }),
+  });
+}
+
+async function signalHistory(topic: string): Promise<SignalRow[]> {
+  const res = await env.DB.prepare(
+    'SELECT id, value, valid_from, valid_to FROM signals WHERE person_id = ? AND topic = ? ORDER BY valid_from'
+  )
+    .bind(PERSON_ID, topic)
+    .all<SignalRow>();
+  return res.results ?? [];
+}
+
+async function valueAsOf(topic: string, at: string): Promise<string[]> {
+  const res = await env.DB.prepare(
+    'SELECT value FROM signals WHERE person_id = ?1 AND topic = ?2 AND julianday(valid_from) <= julianday(?3) AND (valid_to IS NULL OR julianday(valid_to) > julianday(?3))'
+  )
+    .bind(PERSON_ID, topic, at)
+    .all<{ value: string }>();
+  return (res.results ?? []).map((r) => r.value);
 }
 
 async function seedPerson(id = PERSON_ID, alias = '[TEST_DATA] Alex Chen'): Promise<void> {
@@ -118,6 +170,7 @@ describe('D1 /ingest persistence, idempotency, disambiguation, and bitemporal si
         person_id: PERSON_ID,
         source: 'voice_note',
         content: 'Loves iced matcha.',
+        confidence: 0.95,
         signal_topic: 'beverage_preference',
         signal_value: 'loves_iced_matcha',
         occurred_at: '2026-10-01T18:00:00Z',
@@ -134,6 +187,7 @@ describe('D1 /ingest persistence, idempotency, disambiguation, and bitemporal si
         person_id: PERSON_ID,
         source: 'manual',
         content: 'Still loves iced matcha.',
+        confidence: 0.95,
         signal_topic: 'beverage_preference',
         signal_value: 'loves_iced_matcha',
         occurred_at: '2026-10-15T12:00:00Z',
@@ -152,6 +206,7 @@ describe('D1 /ingest persistence, idempotency, disambiguation, and bitemporal si
         person_id: PERSON_ID,
         source: 'chat_log',
         content: 'Quit caffeine, only drinks decaf rooibos now.',
+        confidence: 0.95,
         signal_topic: 'beverage_preference',
         signal_value: 'no_caffeine_rooibos_only',
         occurred_at: '2026-11-15T20:30:00Z',
@@ -164,7 +219,7 @@ describe('D1 /ingest persistence, idempotency, disambiguation, and bitemporal si
     expect(b3.bitemporal_update.action).toBe('superseded_conflicting_signal');
     expect(b3.bitemporal_update.deprecated_signal_id).toBe(b1.bitemporal_update.new_signal_id);
 
-    // 4. Out-of-order historical event from July 10 -> must NOT overwrite Nov 15 active signal
+    // 4. Out-of-order historical event from July 10 -> fills [Jul 10, Oct 1) without overlapping later intervals
     const r4 = await SELF.fetch('https://example.com/ingest', {
       method: 'POST',
       headers: authHeaders(),
@@ -172,6 +227,7 @@ describe('D1 /ingest persistence, idempotency, disambiguation, and bitemporal si
         person_id: PERSON_ID,
         source: 'chat_log',
         content: 'Backfill: drank espresso tonics in July.',
+        confidence: 0.95,
         signal_topic: 'beverage_preference',
         signal_value: 'espresso_tonic',
         occurred_at: '2026-07-10T10:00:00Z',
@@ -183,7 +239,7 @@ describe('D1 /ingest persistence, idempotency, disambiguation, and bitemporal si
     };
     expect(b4.bitemporal_update.action).toBe('recorded_historical_signal');
     expect(b4.bitemporal_update.valid_from).toBe('2026-07-10T10:00:00.000Z');
-    expect(b4.bitemporal_update.valid_to).toBe('2026-11-15T20:30:00.000Z');
+    expect(b4.bitemporal_update.valid_to).toBe('2026-10-01T18:00:00.000Z');
     expect(b4.bitemporal_update.active_value).toBe('no_caffeine_rooibos_only');
 
     // Verify GET /people/:id/signals returns only 1 active signal by default, and 3 total with history
@@ -203,8 +259,9 @@ describe('D1 /ingest persistence, idempotency, disambiguation, and bitemporal si
       { headers: authHeaders() }
     );
     expect(histRes.status).toBe(200);
-    const histJson = (await histRes.json()) as { count: number };
+    const histJson = (await histRes.json()) as { count: number; signals: SignalRow[] };
     expect(histJson.count).toBe(3);
+    expectNoOverlap(histJson.signals);
 
     // Verify GET /people/:id/timeline returns all 4 events ordered descending
     const timelineRes = await SELF.fetch(`https://example.com/people/${PERSON_ID}/timeline`, {
@@ -251,6 +308,7 @@ describe('D1 /ingest persistence, idempotency, disambiguation, and bitemporal si
         person_id: 'nonexistent-person',
         source: 'manual',
         content: 'Should fail person lookup.',
+        confidence: 0.95,
       }),
     });
     expect(unknownRes.status).toBe(422);
@@ -262,6 +320,7 @@ describe('D1 /ingest persistence, idempotency, disambiguation, and bitemporal si
         person_id: PERSON_ID,
         source: 'manual',
         content: 'Missing signal_value.',
+        confidence: 0.95,
         signal_topic: 'beverage_preference',
       }),
     });
@@ -301,5 +360,171 @@ describe('D1 /ingest persistence, idempotency, disambiguation, and bitemporal si
     expect(body.data_classification).toBe('SYNTHETIC_TEST_ONLY');
     expect(body.is_test_data).toBe(true);
     expect(body.counts.people).toBe(1);
+  });
+
+  it('splits a closed interval when a late observation falls inside it', async () => {
+    const topic = 'beverage_preference';
+    expect((await ingest({ content: 'a', signal_topic: topic, signal_value: 'A', occurred_at: '2026-10-01T00:00:00Z' })).status).toBe(201);
+    expect((await ingest({ content: 'b', signal_topic: topic, signal_value: 'B', occurred_at: '2026-11-15T00:00:00Z' })).status).toBe(201);
+
+    const res = await ingest({ content: 'c', signal_topic: topic, signal_value: 'C', occurred_at: '2026-10-20T00:00:00Z' });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as {
+      bitemporal_update: { action: string; valid_from: string; valid_to: string; truncated_signal_id: string };
+    };
+    expect(body.bitemporal_update.action).toBe('recorded_historical_signal');
+    expect(body.bitemporal_update.valid_to).toBe('2026-11-15T00:00:00.000Z');
+
+    const history = await signalHistory(topic);
+    expectNoOverlap(history);
+    expect(history.map((r) => [r.value, r.valid_from, r.valid_to])).toEqual([
+      ['A', '2026-10-01T00:00:00.000Z', '2026-10-20T00:00:00.000Z'],
+      ['C', '2026-10-20T00:00:00.000Z', '2026-11-15T00:00:00.000Z'],
+      ['B', '2026-11-15T00:00:00.000Z', null],
+    ]);
+    expect(await valueAsOf(topic, '2026-10-10T00:00:00.000Z')).toEqual(['A']);
+    expect(await valueAsOf(topic, '2026-10-25T00:00:00.000Z')).toEqual(['C']);
+    expect(await valueAsOf(topic, '2026-12-01T00:00:00.000Z')).toEqual(['B']);
+
+    // Same value re-asserted inside a closed interval is a no-op
+    const same = await ingest({ content: 'c again', signal_topic: topic, signal_value: 'C', occurred_at: '2026-11-01T00:00:00Z' });
+    const sameBody = (await same.json()) as { bitemporal_update: { action: string } };
+    expect(sameBody.bitemporal_update.action).toBe('unchanged_historical_signal');
+    expect(await signalHistory(topic)).toHaveLength(3);
+  });
+
+  it('produces the same non-overlapping timeline regardless of arrival order', async () => {
+    const observations = [
+      { value: 'V1', at: '2026-01-01T00:00:00Z' },
+      { value: 'V2', at: '2026-02-01T00:00:00Z' },
+      { value: 'V3', at: '2026-03-01T00:00:00Z' },
+      { value: 'V4', at: '2026-04-01T00:00:00Z' },
+      { value: 'V5', at: '2026-05-01T00:00:00Z' },
+    ];
+    const orders = [
+      [0, 1, 2, 3, 4],
+      [4, 3, 2, 1, 0],
+      [2, 0, 4, 1, 3],
+      [1, 4, 0, 3, 2],
+    ];
+    const expected = observations.map((o, i) => [
+      o.value,
+      new Date(o.at).toISOString(),
+      i + 1 < observations.length ? new Date(observations[i + 1].at).toISOString() : null,
+    ]);
+
+    for (const order of orders) {
+      const store = new MemoryIngestStore(['p1']);
+      for (const idx of order) {
+        const payload: ParsedIngestPayload = {
+          person_id: 'p1',
+          source: 'manual',
+          content: `obs ${idx}`,
+          confidence: 0.95,
+          signal_topic: 'topic',
+          signal_value: observations[idx].value,
+          signal_category: 'preference',
+          occurred_at: observations[idx].at,
+        };
+        const outcome = await ingestEvent(payload, store, '2026-11-21T00:00:00Z');
+        expect(outcome.status).toBe('persisted');
+      }
+      const rows = [...store.signals].sort((a, b) => Date.parse(a.valid_from) - Date.parse(b.valid_from));
+      expectNoOverlap(rows);
+      expect(rows.map((r) => [r.value, r.valid_from, r.valid_to]), `order ${order.join(',')}`).toEqual(expected);
+    }
+  });
+
+  it('rejects overlapping signal rows at the database level', async () => {
+    await ingest({ content: 'a', signal_topic: 't', signal_value: 'A', occurred_at: '2026-10-01T00:00:00Z' });
+    await ingest({ content: 'b', signal_topic: 't', signal_value: 'B', occurred_at: '2026-11-15T00:00:00Z' });
+    await expect(
+      env.DB.prepare(
+        "INSERT INTO signals (id, person_id, category, topic, value, content, valid_from, valid_to, recorded_at) VALUES ('sig_manual', ?, 'preference', 't', 'X', 't: X', '2026-07-01T00:00:00.000Z', '2026-11-15T00:00:00.000Z', '2026-11-21T00:00:00.000Z')"
+      )
+        .bind(PERSON_ID)
+        .run()
+    ).rejects.toThrow(/signal_valid_time_overlap/);
+  });
+
+  it('redacts PII in signal_topic and signal_value before storing signals', async () => {
+    const res = await ingest({
+      content: 'Shared contact details.',
+      signal_topic: 'contact for bob@example.com',
+      signal_value: 'call 415-555-0199 or email bob@example.com',
+      occurred_at: '2026-10-01T00:00:00Z',
+    });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { redacted_entities: string[] };
+    expect(body.redacted_entities).toEqual(['EMAIL', 'PHONE']);
+
+    const row = await env.DB.prepare('SELECT topic, value, content FROM signals WHERE person_id = ?')
+      .bind(PERSON_ID)
+      .first<{ topic: string; value: string; content: string }>();
+    expect(row?.topic).toBe('contact for [EMAIL_1]');
+    expect(row?.value).toBe('call [PHONE_1] or email [EMAIL_1]');
+    for (const field of [row?.topic, row?.value, row?.content]) {
+      expect(field).not.toContain('bob@example.com');
+      expect(field).not.toContain('415-555-0199');
+    }
+  });
+
+  it('redacts PII in signal_topic and signal_value before storing in disambiguation_queue', async () => {
+    const res = await ingest({
+      person_id: null,
+      content: 'Not sure who this was.',
+      confidence: 0.5,
+      signal_topic: 'phone 415-555-0199',
+      signal_value: 'Name: Alice Smith, alice@example.com',
+    });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { queue_id: string };
+    const row = await env.DB.prepare('SELECT signal_topic, signal_value, redacted_entities FROM disambiguation_queue WHERE id = ?')
+      .bind(body.queue_id)
+      .first<{ signal_topic: string; signal_value: string; redacted_entities: string }>();
+    expect(row?.signal_topic).toBe('phone [PHONE_1]');
+    expect(row?.signal_value).toBe('Name: [PERSON_1], [EMAIL_1]');
+    expect(JSON.parse(row?.redacted_entities ?? '[]')).toEqual(['PHONE', 'EMAIL', 'PERSON']);
+  });
+
+  it('requires an explicit confidence value', async () => {
+    const res = await SELF.fetch('https://example.com/ingest', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ person_id: PERSON_ID, source: 'manual', content: 'maybe her?' }),
+    });
+    expect(res.status).toBe(400);
+    const count = await env.DB.prepare('SELECT COUNT(*) as cnt FROM timeline_events').first<{ cnt: number }>();
+    expect(count?.cnt).toBe(0);
+  });
+
+  it('handles concurrent updates to the same topic without 500s or overlapping intervals', async () => {
+    const topic = 'concurrent_topic';
+    expect((await ingest({ content: 'base', signal_topic: topic, signal_value: 'BASE', occurred_at: '2026-10-01T00:00:00Z' })).status).toBe(201);
+
+    const responses = await Promise.all(
+      [1, 2, 3, 4, 5, 6].map((i) =>
+        ingest({ content: `c${i}`, signal_topic: topic, signal_value: `V${i}`, occurred_at: `2026-11-0${i}T00:00:00Z` })
+      )
+    );
+    const statuses = responses.map((r) => r.status);
+    for (const status of statuses) {
+      expect([201, 409]).toContain(status);
+    }
+
+    const history = await signalHistory(topic);
+    expectNoOverlap(history);
+    expect(history.filter((r) => r.valid_to === null)).toHaveLength(1);
+    expect(history).toHaveLength(1 + statuses.filter((s) => s === 201).length);
+  });
+
+  it('hides /db/demo and /fixtures/verify outside development', async () => {
+    for (const environment of [undefined, 'production']) {
+      for (const path of ['/db/demo', '/fixtures/verify']) {
+        const req = new Request(`https://example.com${path}`, { headers: { Authorization: `Bearer ${env.API_KEY}` } });
+        const res = await worker.fetch(req, { DB: env.DB, API_KEY: env.API_KEY, ENVIRONMENT: environment });
+        expect(res.status, `${path} with ENVIRONMENT=${environment}`).toBe(404);
+      }
+    }
   });
 });
