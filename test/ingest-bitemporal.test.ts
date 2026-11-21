@@ -461,8 +461,11 @@ describe('D1 /ingest persistence, idempotency, disambiguation, and bitemporal si
     const row = await env.DB.prepare('SELECT topic, value, content FROM signals WHERE person_id = ?')
       .bind(PERSON_ID)
       .first<{ topic: string; value: string; content: string }>();
-    expect(row?.topic).toBe('contact for [EMAIL_1]');
-    expect(row?.value).toBe('call [PHONE_1] or email [EMAIL_1]');
+    const topicMatch = row?.topic.match(/^contact for (\[EMAIL_[0-9a-f]{12}\])$/);
+    expect(topicMatch).not.toBeNull();
+    const emailToken = topicMatch![1];
+    expect(row?.value).toMatch(/^call \[PHONE_[0-9a-f]{12}\] or email \[EMAIL_[0-9a-f]{12}\]$/);
+    expect(row?.value.endsWith(emailToken)).toBe(true);
     for (const field of [row?.topic, row?.value, row?.content]) {
       expect(field).not.toContain('bob@example.com');
       expect(field).not.toContain('415-555-0199');
@@ -482,8 +485,8 @@ describe('D1 /ingest persistence, idempotency, disambiguation, and bitemporal si
     const row = await env.DB.prepare('SELECT signal_topic, signal_value, redacted_entities FROM disambiguation_queue WHERE id = ?')
       .bind(body.queue_id)
       .first<{ signal_topic: string; signal_value: string; redacted_entities: string }>();
-    expect(row?.signal_topic).toBe('phone [PHONE_1]');
-    expect(row?.signal_value).toBe('Name: [PERSON_1], [EMAIL_1]');
+    expect(row?.signal_topic).toMatch(/^phone \[PHONE_[0-9a-f]{12}\]$/);
+    expect(row?.signal_value).toMatch(/^Name: \[PERSON_[0-9a-f]{12}\], \[EMAIL_[0-9a-f]{12}\]$/);
     expect(JSON.parse(row?.redacted_entities ?? '[]')).toEqual(['PHONE', 'EMAIL', 'PERSON']);
   });
 
@@ -526,5 +529,32 @@ describe('D1 /ingest persistence, idempotency, disambiguation, and bitemporal si
         expect(res.status, `${path} with ENVIRONMENT=${environment}`).toBe(404);
       }
     }
+  });
+
+  it('keeps redacted signal values and topics comparable across requests', async () => {
+    const topic = 'preferred_contact';
+    expect((await ingest({ content: 'a', signal_topic: topic, signal_value: 'alice@example.com', occurred_at: '2026-10-01T00:00:00Z' })).status).toBe(201);
+
+    // Different email -> must supersede, not be treated as unchanged
+    const changed = await ingest({ content: 'b', signal_topic: topic, signal_value: 'bob@example.com', occurred_at: '2026-10-02T00:00:00Z' });
+    const changedBody = (await changed.json()) as { bitemporal_update: { action: string } };
+    expect(changedBody.bitemporal_update.action).toBe('superseded_conflicting_signal');
+
+    // Same email (different case, different surrounding content) -> unchanged
+    const same = await ingest({
+      content: 'mentions carol@example.com first',
+      signal_topic: topic,
+      signal_value: 'BOB@example.com',
+      occurred_at: '2026-10-03T00:00:00Z',
+    });
+    const sameBody = (await same.json()) as { bitemporal_update: { action: string } };
+    expect(sameBody.bitemporal_update.action).toBe('unchanged_existing_signal');
+
+    // Topics redacted from different emails stay distinct histories
+    await ingest({ content: 'c', signal_topic: 'notes about alice@example.com', signal_value: 'X', occurred_at: '2026-10-01T00:00:00Z' });
+    await ingest({ content: 'd', signal_topic: 'notes about bob@example.com', signal_value: 'Y', occurred_at: '2026-10-01T00:00:00Z' });
+    const topics = await env.DB.prepare("SELECT DISTINCT topic FROM signals WHERE topic LIKE 'notes about %' AND valid_to IS NULL")
+      .all<{ topic: string }>();
+    expect(topics.results).toHaveLength(2);
   });
 });

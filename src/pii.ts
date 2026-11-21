@@ -45,7 +45,12 @@ export interface PiiRedactor {
  * (such as Microsoft Presidio). Unstructured free-text first names without explicit markers
  * require downstream NER.
  */
-export function createPiiRedactor(): PiiRedactor {
+export interface PiiRedactorOptions {
+  /** Maps a detected entity to its placeholder token. Defaults to per-redactor ordinals ([EMAIL_1], ...). */
+  tokenFor?: (type: PiiEntityType, normalizedValue: string) => string;
+}
+
+export function createPiiRedactor(options: PiiRedactorOptions = {}): PiiRedactor {
   const tokenMap = new Map<string, string>();
   const typeCounters: Record<PiiEntityType, number> = {
     EMAIL: 0,
@@ -67,7 +72,7 @@ export function createPiiRedactor(): PiiRedactor {
     }
 
     typeCounters[type] += 1;
-    const token = `[${type}_${typeCounters[type]}]`;
+    const token = options.tokenFor ? options.tokenFor(type, normalizedValue) : `[${type}_${typeCounters[type]}]`;
     tokenMap.set(cacheKey, token);
     redactions.push({ type, token });
 
@@ -147,6 +152,44 @@ export function createPiiRedactor(): PiiRedactor {
       redactions: [...redactions],
     }),
   };
+}
+
+const DEFAULT_PII_TOKEN_KEY = 'relationship-journal-pii-token-v1';
+
+/**
+ * Builds a redactor whose tokens are stable across requests: `[TYPE_<hmac-sha256 prefix>]`
+ * keyed by `key`. Use this for values that are compared across requests (signal topics and
+ * values), where per-request ordinals would make different entities look identical.
+ * Without a secret key the tokens are plain SHA-256 fingerprints, which low-entropy values
+ * (e.g. phone numbers) do not protect against brute force; set PII_TOKEN_KEY in production.
+ */
+export async function createStablePiiRedactor(texts: string[], key?: string): Promise<PiiRedactor> {
+  const entities = new Map<string, { type: PiiEntityType }>();
+  const collector = createPiiRedactor({
+    tokenFor: (type, normalized) => {
+      entities.set(`${type}:${normalized}`, { type });
+      return `[${type}]`;
+    },
+  });
+  for (const text of texts) collector.redact(text);
+
+  const hmacKey = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(key || DEFAULT_PII_TOKEN_KEY),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const tokens = new Map<string, string>();
+  for (const [cacheKey, { type }] of entities) {
+    const mac = await crypto.subtle.sign('HMAC', hmacKey, new TextEncoder().encode(cacheKey));
+    const hex = [...new Uint8Array(mac)].map((b) => b.toString(16).padStart(2, '0')).join('');
+    tokens.set(cacheKey, `[${type}_${hex.slice(0, 12)}]`);
+  }
+
+  return createPiiRedactor({
+    tokenFor: (type, normalized) => tokens.get(`${type}:${normalized}`) ?? `[${type}]`,
+  });
 }
 
 export function stripPII(raw: string): PiiRedactionResult {

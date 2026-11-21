@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { createPiiRedactor, type PiiEntityType } from './pii';
+import { createStablePiiRedactor, type PiiEntityType } from './pii';
 
 export const IngestPayloadSchema = z
   .object({
@@ -627,10 +627,16 @@ export function planSignalWrite(params: {
   };
 }
 
+export interface IngestOptions {
+  /** Secret used to derive stable PII placeholder tokens (see createStablePiiRedactor). */
+  piiTokenKey?: string;
+}
+
 export async function ingestEvent(
   payload: ParsedIngestPayload,
   store: IngestStore,
-  nowIso?: string
+  nowIso?: string,
+  options: IngestOptions = {}
 ): Promise<IngestOutcome> {
   const idempotencyKey = await makeIdempotencyKey(payload);
 
@@ -642,8 +648,12 @@ export async function ingestEvent(
   const recordedAt = nowIso ?? new Date().toISOString();
   const occurredAt = payload.occurred_at ? new Date(payload.occurred_at).toISOString() : recordedAt;
 
-  // One redactor across all free-text fields so placeholder tokens stay consistent.
-  const redactor = createPiiRedactor();
+  // One redactor across all free-text fields; tokens are stable across requests so redacted
+  // signal topics/values can still be compared against stored history.
+  const redactor = await createStablePiiRedactor(
+    [payload.content, payload.signal_topic ?? '', payload.signal_value ?? ''],
+    options.piiTokenKey
+  );
   const sanitized = redactor.redact(payload.content);
   const signalTopic = payload.signal_topic !== undefined ? redactor.redact(payload.signal_topic) : undefined;
   const signalValue = payload.signal_value !== undefined ? redactor.redact(payload.signal_value) : undefined;

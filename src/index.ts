@@ -10,10 +10,12 @@ import {
 } from './pipeline';
 import * as schema from './schema';
 
-export type RuntimeEnv = Omit<Env, 'API_KEY' | 'ENVIRONMENT'> & {
+export type RuntimeEnv = Omit<Env, 'API_KEY' | 'ENVIRONMENT' | 'PII_TOKEN_KEY'> & {
   API_KEY?: string;
   /** Diagnostic endpoints (/db/demo, /fixtures/verify) are only served when this is 'development'. */
   ENVIRONMENT?: string;
+  /** Secret for stable PII placeholder tokens; set in production. */
+  PII_TOKEN_KEY?: string;
 };
 
 const DEV_ONLY_PATHS = new Set(['/db/demo', '/fixtures/verify']);
@@ -65,7 +67,9 @@ export default {
           return jsonResponse({ error: parsed.error.flatten() }, 400);
         }
 
-        const outcome = await ingestEvent(parsed.data, new D1IngestStore(env.DB));
+        const outcome = await ingestEvent(parsed.data, new D1IngestStore(env.DB), undefined, {
+        piiTokenKey: env.PII_TOKEN_KEY,
+      });
         return jsonResponse(outcome, outcome.http_status);
       }
 
