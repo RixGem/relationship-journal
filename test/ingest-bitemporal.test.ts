@@ -521,14 +521,58 @@ describe('D1 /ingest persistence, idempotency, disambiguation, and bitemporal si
     expect(history).toHaveLength(1 + statuses.filter((s) => s === 201).length);
   });
 
-  it('hides /db/demo and /fixtures/verify outside development', async () => {
-    for (const environment of [undefined, 'production']) {
-      for (const path of ['/db/demo', '/fixtures/verify']) {
-        const req = new Request(`https://example.com${path}`, { headers: { Authorization: `Bearer ${env.API_KEY}` } });
-        const res = await worker.fetch(req, { DB: env.DB, API_KEY: env.API_KEY, ENVIRONMENT: environment });
-        expect(res.status, `${path} with ENVIRONMENT=${environment}`).toBe(404);
-      }
-    }
+  it('serves /db/demo and /fixtures/verify publicly in production while strictly scoping /db/demo to [TEST_DATA] rows', async () => {
+    const privatePersonId = 'real-person-private-001';
+    await env.DB.prepare(
+      'INSERT INTO people (id, alias, relationship_state, key_dates, created_at) VALUES (?, ?, ?, ?, ?)'
+    )
+      .bind(privatePersonId, 'Real Private Contact', 'active', '{}', '2026-10-01T00:00:00Z')
+      .run();
+
+    await ingest({
+      person_id: privatePersonId,
+      content: 'Private journal note that must never appear on /db/demo.',
+      signal_topic: 'private_topic',
+      signal_value: 'private_secret_value',
+      occurred_at: '2026-10-02T00:00:00Z',
+    });
+
+    await ingest({
+      person_id: null,
+      content: 'Ambiguous private note for disambiguation queue.',
+      confidence: 0.4,
+    });
+
+    const demoRes = await worker.fetch(new Request('https://example.com/db/demo'), {
+      DB: env.DB,
+      API_KEY: env.API_KEY,
+      ENVIRONMENT: 'production',
+    });
+    expect(demoRes.status).toBe(200);
+    const demoBody = (await demoRes.json()) as {
+      data_classification: string;
+      counts: { people: number; timeline_events: number; signals: number };
+      tables: {
+        people: Array<{ id: string; alias: string }>;
+        timeline_events: Array<{ person_id: string; summary: string }>;
+        signals: Array<{ person_id: string; value: string }>;
+        disambiguation_queue?: unknown;
+      };
+    };
+
+    expect(demoBody.data_classification).toBe('SYNTHETIC_TEST_ONLY');
+    expect(demoBody.counts.people).toBe(1);
+    expect(demoBody.tables.people.map((p) => p.id)).toEqual([PERSON_ID]);
+    expect(demoBody.tables.timeline_events.every((e) => e.person_id === PERSON_ID)).toBe(true);
+    expect(demoBody.tables.signals.every((s) => s.person_id === PERSON_ID)).toBe(true);
+    expect(demoBody.tables.disambiguation_queue).toBeUndefined();
+
+    const fixturesRes = await worker.fetch(new Request('https://example.com/fixtures/verify'), {
+      DB: env.DB,
+      API_KEY: env.API_KEY,
+      ENVIRONMENT: 'production',
+    });
+    expect(fixturesRes.status).toBe(200);
   });
 
   it('keeps redacted signal values and topics comparable across requests', async () => {

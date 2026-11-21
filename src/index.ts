@@ -1,6 +1,7 @@
 import { and, desc, eq, isNull } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/d1';
 import { requireBearerAuth } from './auth';
+import { MCP_TOOLS, handleMcpRequest } from './mcp';
 import {
   D1IngestStore,
   IngestPayloadSchema,
@@ -12,13 +13,10 @@ import * as schema from './schema';
 
 export type RuntimeEnv = Omit<Env, 'API_KEY' | 'ENVIRONMENT' | 'PII_TOKEN_KEY'> & {
   API_KEY?: string;
-  /** Diagnostic endpoints (/db/demo, /fixtures/verify) are only served when this is 'development'. */
   ENVIRONMENT?: string;
   /** Secret for stable PII placeholder tokens; set in production. */
   PII_TOKEN_KEY?: string;
 };
-
-const DEV_ONLY_PATHS = new Set(['/db/demo', '/fixtures/verify']);
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
@@ -50,14 +48,99 @@ export default {
         });
       }
 
-      // All data, ingestion, and diagnostic endpoints require Bearer authentication
+      // Public synthetic demo dataset viewer (strictly scoped to [TEST_DATA] rows only)
+      if (url.pathname === '/db/demo' && request.method === 'GET') {
+        const [peopleRes, eventsRes, signalsRes] = await Promise.all([
+          env.DB.prepare(
+            "SELECT id, alias, relationship_state, key_dates, created_at FROM people WHERE alias LIKE '[TEST_DATA]%' ORDER BY id ASC"
+          ).all<{
+            id: string;
+            alias: string;
+            relationship_state: string;
+            key_dates: string;
+            created_at: string;
+          }>(),
+          env.DB.prepare(
+            "SELECT e.id, e.person_id, e.source, e.summary, e.raw_quote, e.redacted_entities, e.sentiment_score, e.idempotency_key, e.occurred_at, e.recorded_at FROM timeline_events e INNER JOIN people p ON p.id = e.person_id WHERE p.alias LIKE '[TEST_DATA]%' ORDER BY e.occurred_at DESC"
+          ).all<{
+            id: string;
+            person_id: string;
+            source: string;
+            summary: string;
+            raw_quote: string | null;
+            redacted_entities: string;
+            sentiment_score: number | null;
+            idempotency_key: string | null;
+            occurred_at: string;
+            recorded_at: string;
+          }>(),
+          env.DB.prepare(
+            "SELECT s.id, s.person_id, s.category, s.topic, s.value, s.content, s.valid_from, s.valid_to, s.recorded_at, s.superseded_at, s.superseded_by FROM signals s INNER JOIN people p ON p.id = s.person_id WHERE p.alias LIKE '[TEST_DATA]%' ORDER BY s.valid_from ASC"
+          ).all(),
+        ]);
+
+        const peopleRows = (peopleRes.results ?? []).map((row) => ({
+          ...row,
+          key_dates: parseJsonSafe<Record<string, unknown>>(row.key_dates, {}),
+        }));
+        const eventRows = (eventsRes.results ?? []).map((row) => ({
+          ...row,
+          redacted_entities: parseJsonSafe<string[]>(row.redacted_entities, []),
+        }));
+        const signalRows = signalsRes.results ?? [];
+
+        return jsonResponse({
+          data_classification: 'SYNTHETIC_TEST_ONLY',
+          is_test_data: true,
+          counts: {
+            people: peopleRows.length,
+            timeline_events: eventRows.length,
+            signals: signalRows.length,
+          },
+          tables: {
+            people: peopleRows,
+            timeline_events: eventRows,
+            signals: signalRows,
+          },
+        });
+      }
+
+      // Public isolated sandbox fixture suite (never touches production D1)
+      if (url.pathname === '/fixtures/verify' && request.method === 'GET') {
+        const sandboxStore = new MemoryIngestStore(['person_synth_001']);
+        const results = [];
+
+        for (const fixture of SYNTHETIC_FIXTURES) {
+          const outcome = await ingestEvent(fixture.payload, sandboxStore, '2026-11-21T00:00:00Z');
+          results.push({ test_case: fixture.case, outcome });
+        }
+
+        return jsonResponse({
+          suite: 'synthetic_edge_case_verification',
+          isolated_sandbox: true,
+          passed: results.length,
+          results,
+          final_bitemporal_signal_state: sandboxStore.signals,
+          disambiguation_queue: sandboxStore.disambiguationQueue,
+        });
+      }
+
+      // All data, ingestion, and MCP endpoints require Bearer authentication
       const auth = await requireBearerAuth(request, env);
       if (!auth.ok) {
         return auth.response;
       }
 
-      if (DEV_ONLY_PATHS.has(url.pathname) && env.ENVIRONMENT !== 'development') {
-        return jsonResponse({ error: 'Not Found' }, 404);
+      if (url.pathname === '/mcp') {
+        return handleMcpRequest(request, env);
+      }
+
+      if (url.pathname === '/mcp/tools' && request.method === 'GET') {
+        return jsonResponse({
+          protocol: 'mcp',
+          endpoint: '/mcp',
+          tools: MCP_TOOLS,
+        });
       }
 
       if (url.pathname === '/ingest' && request.method === 'POST') {
@@ -140,116 +223,6 @@ export default {
           include_history: includeHistory,
           count: signalRows.length,
           signals: signalRows,
-        });
-      }
-
-      if (url.pathname === '/db/demo' && request.method === 'GET') {
-        const [peopleRes, eventsRes, signalsRes, queueRes, idempotencyRes] = await Promise.all([
-          env.DB.prepare(
-            'SELECT id, alias, relationship_state, key_dates, created_at FROM people ORDER BY id ASC'
-          ).all<{
-            id: string;
-            alias: string;
-            relationship_state: string;
-            key_dates: string;
-            created_at: string;
-          }>(),
-          env.DB.prepare(
-            'SELECT id, person_id, source, summary, raw_quote, redacted_entities, sentiment_score, idempotency_key, occurred_at, recorded_at FROM timeline_events ORDER BY occurred_at DESC'
-          ).all<{
-            id: string;
-            person_id: string;
-            source: string;
-            summary: string;
-            raw_quote: string | null;
-            redacted_entities: string;
-            sentiment_score: number | null;
-            idempotency_key: string | null;
-            occurred_at: string;
-            recorded_at: string;
-          }>(),
-          env.DB.prepare(
-            'SELECT id, person_id, category, topic, value, content, valid_from, valid_to, recorded_at, superseded_at, superseded_by FROM signals ORDER BY valid_from ASC'
-          ).all(),
-          env.DB.prepare(
-            'SELECT id, idempotency_key, source, sanitized_content, redacted_entities, confidence, signal_topic, signal_value, signal_category, occurred_at, status, created_at FROM disambiguation_queue ORDER BY created_at DESC'
-          ).all(),
-          env.DB.prepare('SELECT COUNT(*) as total FROM idempotency_keys').first<{ total: number }>(),
-        ]);
-
-        const peopleRows = (peopleRes.results ?? []).map((row) => ({
-          ...row,
-          key_dates: parseJsonSafe<Record<string, unknown>>(row.key_dates, {}),
-        }));
-        const eventRows = (eventsRes.results ?? []).map((row) => ({
-          ...row,
-          redacted_entities: parseJsonSafe<string[]>(row.redacted_entities, []),
-        }));
-        const signalRows = signalsRes.results ?? [];
-        const queueRows = queueRes.results ?? [];
-
-        return jsonResponse({
-          data_classification: 'SYNTHETIC_TEST_ONLY',
-          is_test_data: true,
-          counts: {
-            people: peopleRows.length,
-            timeline_events: eventRows.length,
-            signals: signalRows.length,
-            disambiguation_queue: queueRows.length,
-            idempotency_keys: idempotencyRes?.total ?? 0,
-          },
-          tables: {
-            people: peopleRows,
-            timeline_events: eventRows,
-            signals: signalRows,
-            disambiguation_queue: queueRows,
-          },
-        });
-      }
-
-      if (url.pathname === '/fixtures/verify' && request.method === 'GET') {
-        const sandboxStore = new MemoryIngestStore(['person_synth_001']);
-        const results = [];
-
-        for (const fixture of SYNTHETIC_FIXTURES) {
-          const outcome = await ingestEvent(fixture.payload, sandboxStore, '2026-11-21T00:00:00Z');
-          results.push({ test_case: fixture.case, outcome });
-        }
-
-        return jsonResponse({
-          suite: 'synthetic_edge_case_verification',
-          isolated_sandbox: true,
-          passed: results.length,
-          results,
-          final_bitemporal_signal_state: sandboxStore.signals,
-          disambiguation_queue: sandboxStore.disambiguationQueue,
-        });
-      }
-
-      if (url.pathname === '/mcp/tools' && request.method === 'GET') {
-        return jsonResponse({
-          tools: [
-            {
-              name: 'ingest_relationship_event',
-              method: 'POST',
-              endpoint: '/ingest',
-              description:
-                'Sanitize PII, deduplicate by SHA-256 idempotency key, route low-confidence items to disambiguation_queue, and persist bitemporal signals to D1',
-            },
-            {
-              name: 'query_timeline_events',
-              method: 'GET',
-              endpoint: '/people/:id/timeline',
-              description: 'Query anonymized relationship timeline events from D1 by person_id',
-            },
-            {
-              name: 'get_active_signals',
-              method: 'GET',
-              endpoint: '/people/:id/signals',
-              description:
-                'Retrieve non-superseded (valid_to IS NULL) signals or full bitemporal history (?include_history=true) from D1',
-            },
-          ],
         });
       }
 
