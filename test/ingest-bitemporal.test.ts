@@ -557,4 +557,22 @@ describe('D1 /ingest persistence, idempotency, disambiguation, and bitemporal si
       .all<{ topic: string }>();
     expect(topics.results).toHaveLength(2);
   });
+
+  it('refuses /ingest outside development when PII_TOKEN_KEY is unset', async () => {
+    const makeReq = () =>
+      new Request('https://example.com/ingest', {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ person_id: PERSON_ID, source: 'manual', content: 'x', confidence: 0.95 }),
+      });
+    const refused = await worker.fetch(makeReq(), { DB: env.DB, API_KEY: env.API_KEY, ENVIRONMENT: 'production' });
+    expect(refused.status).toBe(503);
+    const accepted = await worker.fetch(makeReq(), {
+      DB: env.DB,
+      API_KEY: env.API_KEY,
+      ENVIRONMENT: 'production',
+      PII_TOKEN_KEY: 'prod-secret',
+    });
+    expect(accepted.status).toBe(201);
+  });
 });

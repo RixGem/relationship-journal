@@ -27,7 +27,7 @@ Cloudflare Workers REST API backed by **Cloudflare D1 (SQLite)** and **Drizzle O
 | `GET /fixtures/verify` | Bearer, dev only | Executes synthetic edge-case suite inside an isolated per-request `MemoryIngestStore` sandbox |
 | `GET /mcp/tools` | Bearer | Returns tool manifest aligned with implemented API routes |
 
-PII in `content`, `signal_topic` and `signal_value` is replaced with stable HMAC tokens (e.g. `[EMAIL_3f9a1c2e4b5d]`) so redacted signals stay comparable across requests; set the `PII_TOKEN_KEY` secret in production.
+PII in `content`, `signal_topic` and `signal_value` is replaced with stable HMAC tokens (e.g. `[EMAIL_3f9a1c2e4b5d]`) so redacted signals stay comparable across requests. Outside development, `/ingest` returns `503` until the `PII_TOKEN_KEY` secret is set (`npx wrangler secret put PII_TOKEN_KEY`, e.g. `openssl rand -hex 32`). Rotating it changes all future tokens, so redacted topics no longer match their earlier history.
 
 `/db/demo` and `/fixtures/verify` return `404` unless `ENVIRONMENT=development` is set (e.g. in `.dev.vars`). Do not set it in production.
 
@@ -55,5 +55,6 @@ npm run dev
 ```bash
 npm run db:migrate:remote
 npx wrangler secret put API_KEY
+npx wrangler secret put PII_TOKEN_KEY
 npm run deploy
 ```

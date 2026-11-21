@@ -160,8 +160,9 @@ const DEFAULT_PII_TOKEN_KEY = 'relationship-journal-pii-token-v1';
  * Builds a redactor whose tokens are stable across requests: `[TYPE_<hmac-sha256 prefix>]`
  * keyed by `key`. Use this for values that are compared across requests (signal topics and
  * values), where per-request ordinals would make different entities look identical.
- * Without a secret key the tokens are plain SHA-256 fingerprints, which low-entropy values
- * (e.g. phone numbers) do not protect against brute force; set PII_TOKEN_KEY in production.
+ * The fallback key is public and only for development/tests: with it, tokens of low-entropy
+ * values (phone numbers, SSNs) can be brute-forced. The Worker refuses /ingest outside
+ * development unless PII_TOKEN_KEY is set.
  */
 export async function createStablePiiRedactor(texts: string[], key?: string): Promise<PiiRedactor> {
   const entities = new Map<string, { type: PiiEntityType }>();

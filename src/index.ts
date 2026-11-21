@@ -61,6 +61,12 @@ export default {
       }
 
       if (url.pathname === '/ingest' && request.method === 'POST') {
+        if (!env.PII_TOKEN_KEY && env.ENVIRONMENT !== 'development') {
+          return jsonResponse(
+            { error: 'Service misconfigured: PII_TOKEN_KEY secret is not set; refusing to store PII tokens.' },
+            503
+          );
+        }
         const body = await request.json().catch(() => null);
         const parsed = IngestPayloadSchema.safeParse(body);
         if (!parsed.success) {
@@ -68,8 +74,8 @@ export default {
         }
 
         const outcome = await ingestEvent(parsed.data, new D1IngestStore(env.DB), undefined, {
-        piiTokenKey: env.PII_TOKEN_KEY,
-      });
+          piiTokenKey: env.PII_TOKEN_KEY,
+        });
         return jsonResponse(outcome, outcome.http_status);
       }
 
