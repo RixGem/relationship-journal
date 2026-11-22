@@ -8,14 +8,13 @@ export function renderFrontendHtml(): string {
   <style>
     /* ==========================================================================
        Apple Human Interface Guidelines (HIG) Semantic Design System
-       Supports Light & Dark Appearances with authentic iOS / macOS Materials
        ========================================================================== */
     :root {
       --sys-bg-primary: #F2F2F7;
       --sys-bg-secondary: #FFFFFF;
       --sys-bg-tertiary: #E5E5EA;
-      --sys-sidebar-bg: rgba(242, 242, 247, 0.78);
-      --sys-toolbar-bg: rgba(255, 255, 255, 0.75);
+      --sys-sidebar-bg: rgba(242, 242, 247, 0.85);
+      --sys-topbar-bg: rgba(255, 255, 255, 0.82);
       --sys-sheet-bg: #F2F2F7;
       --sys-fill-tertiary: rgba(118, 118, 128, 0.12);
       --sys-fill-quaternary: rgba(116, 116, 128, 0.08);
@@ -38,6 +37,13 @@ export function renderFrontendHtml(): string {
       --apple-purple: #AF52DE;
       --apple-indigo: #5856D6;
       --apple-teal: #30B0C7;
+
+      /* Priority Row Tints */
+      --tint-risk-bg: rgba(255, 59, 48, 0.06);
+      --tint-warn-bg: rgba(255, 149, 0, 0.05);
+      --badge-risk-bg: rgba(255, 59, 48, 0.14);
+      --badge-warn-bg: rgba(255, 149, 0, 0.15);
+      --badge-ok-bg: rgba(52, 199, 89, 0.14);
     }
 
     @media (prefers-color-scheme: dark) {
@@ -45,8 +51,8 @@ export function renderFrontendHtml(): string {
         --sys-bg-primary: #000000;
         --sys-bg-secondary: #1C1C1E;
         --sys-bg-tertiary: #2C2C2E;
-        --sys-sidebar-bg: rgba(28, 28, 30, 0.75);
-        --sys-toolbar-bg: rgba(28, 28, 30, 0.72);
+        --sys-sidebar-bg: rgba(28, 28, 30, 0.82);
+        --sys-topbar-bg: rgba(28, 28, 30, 0.80);
         --sys-sheet-bg: #1C1C1E;
         --sys-fill-tertiary: rgba(118, 118, 128, 0.24);
         --sys-fill-quaternary: rgba(116, 116, 128, 0.18);
@@ -68,6 +74,12 @@ export function renderFrontendHtml(): string {
         --apple-purple: #BF5AF2;
         --apple-indigo: #5E5CE6;
         --apple-teal: #40C8E0;
+
+        --tint-risk-bg: rgba(255, 69, 58, 0.11);
+        --tint-warn-bg: rgba(255, 159, 10, 0.09);
+        --badge-risk-bg: rgba(255, 69, 58, 0.20);
+        --badge-warn-bg: rgba(255, 159, 10, 0.20);
+        --badge-ok-bg: rgba(48, 209, 88, 0.18);
       }
     }
 
@@ -75,8 +87,8 @@ export function renderFrontendHtml(): string {
       --sys-bg-primary: #000000;
       --sys-bg-secondary: #1C1C1E;
       --sys-bg-tertiary: #2C2C2E;
-      --sys-sidebar-bg: rgba(28, 28, 30, 0.75);
-      --sys-toolbar-bg: rgba(28, 28, 30, 0.72);
+      --sys-sidebar-bg: rgba(28, 28, 30, 0.82);
+      --sys-topbar-bg: rgba(28, 28, 30, 0.80);
       --sys-sheet-bg: #1C1C1E;
       --sys-fill-tertiary: rgba(118, 118, 128, 0.24);
       --sys-fill-quaternary: rgba(116, 116, 128, 0.18);
@@ -98,6 +110,12 @@ export function renderFrontendHtml(): string {
       --apple-purple: #BF5AF2;
       --apple-indigo: #5E5CE6;
       --apple-teal: #40C8E0;
+
+      --tint-risk-bg: rgba(255, 69, 58, 0.11);
+      --tint-warn-bg: rgba(255, 159, 10, 0.09);
+      --badge-risk-bg: rgba(255, 69, 58, 0.20);
+      --badge-warn-bg: rgba(255, 159, 10, 0.20);
+      --badge-ok-bg: rgba(48, 209, 88, 0.18);
     }
 
     * {
@@ -185,6 +203,48 @@ export function renderFrontendHtml(): string {
     .hig-btn-primary:hover { opacity: 0.92; }
     .hig-btn-primary:active { transform: scale(0.985); }
 
+    /* SF Symbol Icon Buttons */
+    .sf-icon-btn {
+      appearance: none;
+      border: none;
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      background: var(--sys-fill-tertiary);
+      color: var(--apple-blue);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: background 0.15s ease, transform 0.1s ease;
+      flex-shrink: 0;
+    }
+    .sf-icon-btn svg {
+      width: 18px;
+      height: 18px;
+      stroke: currentColor;
+      stroke-width: 2;
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .sf-icon-btn:hover {
+      background: var(--sys-fill-quaternary);
+    }
+    .sf-icon-btn:active {
+      transform: scale(0.93);
+    }
+    .sf-icon-btn.primary {
+      background: var(--apple-blue);
+      color: #FFFFFF;
+    }
+    .sf-icon-btn.primary:hover {
+      opacity: 0.9;
+    }
+    .sf-icon-btn.muted {
+      color: var(--sys-label-secondary);
+    }
+
     .hig-text-btn {
       appearance: none;
       border: none;
@@ -196,34 +256,8 @@ export function renderFrontendHtml(): string {
       cursor: pointer;
       padding: 6px 10px;
       border-radius: 8px;
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
     }
-    .hig-text-btn:hover { background: var(--sys-fill-quaternary); }
     .hig-text-btn.bold { font-weight: 600; }
-
-    .hig-pill-btn {
-      appearance: none;
-      border: none;
-      background: var(--sys-fill-tertiary);
-      color: var(--apple-blue);
-      font-family: inherit;
-      font-size: 13.5px;
-      font-weight: 600;
-      padding: 7px 14px;
-      border-radius: 999px;
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      transition: background 0.15s ease;
-    }
-    .hig-pill-btn:hover { opacity: 0.85; }
-    .hig-pill-btn.filled {
-      background: var(--apple-blue);
-      color: #FFFFFF;
-    }
 
     .hig-alert {
       margin-top: 14px;
@@ -239,42 +273,89 @@ export function renderFrontendHtml(): string {
       color: var(--apple-red);
     }
 
-    /* ======================== APPLE SPLIT VIEW SHELL ======================== */
+    /* ======================== UNIFIED TOP NAVIGATION BAR ======================== */
     .app-workspace {
       display: none;
       min-height: 100vh;
-    }
-    .split-view {
-      display: grid;
-      grid-template-columns: 310px 1fr;
-      min-height: 100vh;
-    }
-    @media (max-width: 860px) {
-      .split-view { grid-template-columns: 1fr; }
+      flex-direction: column;
     }
 
-    /* Sidebar (macOS / iPadOS Translucent Sidebar Material) */
-    .hig-sidebar {
-      background: var(--sys-sidebar-bg);
-      backdrop-filter: blur(30px) saturate(180%);
-      -webkit-backdrop-filter: blur(30px) saturate(180%);
-      border-right: 0.5px solid var(--sys-separator);
-      padding: 16px 14px 32px;
-      display: flex;
-      flex-direction: column;
-      gap: 18px;
-    }
-    .sidebar-toolbar {
+    .global-topbar {
+      position: sticky;
+      top: 0;
+      z-index: 40;
+      height: 54px;
+      background: var(--sys-topbar-bg);
+      backdrop-filter: blur(28px) saturate(180%);
+      -webkit-backdrop-filter: blur(28px) saturate(180%);
+      border-bottom: 0.5px solid var(--sys-separator);
+      padding: 0 20px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 2px 6px;
+      gap: 12px;
     }
-    .sidebar-title {
-      font-size: 20px;
+    .topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .app-title {
+      font-size: 18px;
       font-weight: 700;
       letter-spacing: -0.02em;
     }
+    .topbar-metrics {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      font-size: 13px;
+      color: var(--sys-label-secondary);
+    }
+    .topbar-metrics b {
+      color: var(--sys-label-primary);
+      font-weight: 600;
+    }
+    @media (max-width: 640px) {
+      .topbar-metrics { display: none; }
+    }
+    .topbar-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    /* ======================== APPLE SPLIT VIEW ======================== */
+    .split-view {
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      flex: 1;
+      min-height: calc(100vh - 54px);
+    }
+    @media (max-width: 860px) {
+      .split-view {
+        grid-template-columns: 1fr;
+        min-height: auto;
+      }
+    }
+
+    /* Left Sidebar */
+    .hig-sidebar {
+      background: var(--sys-sidebar-bg);
+      border-right: 0.5px solid var(--sys-separator);
+      padding: 16px 14px 28px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    @media (max-width: 860px) {
+      .hig-sidebar {
+        border-right: none;
+        border-bottom: 0.5px solid var(--sys-separator);
+        padding-bottom: 18px;
+      }
+    }
+
     .search-field {
       position: relative;
     }
@@ -308,14 +389,32 @@ export function renderFrontendHtml(): string {
       font-size: 12px;
       font-weight: 600;
       color: var(--sys-label-secondary);
-      padding: 0 10px;
+      padding: 0 8px;
       margin-bottom: 6px;
       display: flex;
       align-items: center;
       justify-content: space-between;
     }
+    .legend-dots {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      font-weight: 500;
+    }
+    .legend-dots span {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+    }
+    .legend-dots i {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      display: inline-block;
+    }
 
-    /* Apple Inset Grouped List inside Sidebar */
+    /* Unified Inset Grouped Contact List with Priority Color Coding */
     .inset-group {
       background: var(--sys-bg-secondary);
       border-radius: 12px;
@@ -327,23 +426,35 @@ export function renderFrontendHtml(): string {
       display: flex;
       align-items: center;
       gap: 12px;
-      padding: 10px 12px;
+      padding: 11px 12px;
       cursor: pointer;
       position: relative;
       transition: background 0.12s ease;
+    }
+    /* Priority Severity Left Accent & Soft Tint */
+    .contact-row.priority-risk {
+      background: var(--tint-risk-bg);
+      border-left: 3.5px solid var(--apple-red);
+      padding-left: 9.5px;
+    }
+    .contact-row.priority-warn {
+      background: var(--tint-warn-bg);
+      border-left: 3.5px solid var(--apple-orange);
+      padding-left: 9.5px;
     }
     .contact-row:hover {
       background: var(--sys-fill-quaternary);
     }
     .contact-row.selected {
-      background: var(--apple-blue);
+      background: var(--apple-blue) !important;
+      border-left-color: transparent !important;
       color: #FFFFFF;
     }
     .contact-row.selected .row-sub,
-    .contact-row.selected .row-score {
-      color: rgba(255, 255, 255, 0.85) !important;
+    .contact-row.selected .priority-pill {
+      color: #FFFFFF !important;
+      background: rgba(255, 255, 255, 0.22) !important;
     }
-    /* Apple 56px-indented 0.5px hairline divider */
     .contact-row:not(:last-child)::after {
       content: "";
       position: absolute;
@@ -368,6 +479,7 @@ export function renderFrontendHtml(): string {
       font-size: 15px;
       color: #FFFFFF;
       flex-shrink: 0;
+      position: relative;
     }
     .row-main {
       flex: 1;
@@ -383,62 +495,50 @@ export function renderFrontendHtml(): string {
     .row-sub {
       font-size: 12px;
       color: var(--sys-label-secondary);
-      margin-top: 1px;
+      margin-top: 2px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
-    .row-score {
-      font-size: 13px;
+    .priority-pill {
+      font-size: 12px;
       font-weight: 600;
-      display: flex;
+      padding: 3px 9px;
+      border-radius: 999px;
+      flex-shrink: 0;
+      display: inline-flex;
       align-items: center;
-      gap: 5px;
+      gap: 4px;
     }
-    .status-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
+    .priority-pill.risk {
+      background: var(--badge-risk-bg);
+      color: var(--apple-red);
+    }
+    .priority-pill.warn {
+      background: var(--badge-warn-bg);
+      color: var(--apple-orange);
+    }
+    .priority-pill.ok {
+      background: var(--badge-ok-bg);
+      color: var(--apple-green);
+    }
+    .priority-pill.muted {
+      background: var(--sys-fill-tertiary);
+      color: var(--sys-label-secondary);
     }
 
     /* ======================== DETAIL CANVAS ======================== */
     .detail-stage {
-      display: flex;
-      flex-direction: column;
       min-width: 0;
     }
-    .detail-navbar {
-      position: sticky;
-      top: 0;
-      z-index: 20;
-      background: var(--sys-toolbar-bg);
-      backdrop-filter: blur(25px) saturate(180%);
-      -webkit-backdrop-filter: blur(25px) saturate(180%);
-      border-bottom: 0.5px solid var(--sys-separator);
-      padding: 12px 28px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-    .navbar-stats {
-      display: flex;
-      align-items: center;
-      gap: 16px;
-      font-size: 13px;
-      color: var(--sys-label-secondary);
-    }
-    .navbar-stats b {
-      color: var(--sys-label-primary);
-      font-weight: 600;
-    }
-    .navbar-actions {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
     .detail-container {
       max-width: 960px;
       width: 100%;
       margin: 0 auto;
       padding: 28px 28px 64px;
+    }
+    @media (max-width: 640px) {
+      .detail-container { padding: 20px 16px 48px; }
     }
 
     /* Apple Contacts Hero Banner */
@@ -446,37 +546,39 @@ export function renderFrontendHtml(): string {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      flex-wrap: wrap;
       gap: 16px;
       margin-bottom: 24px;
     }
     .hero-left {
       display: flex;
       align-items: center;
-      gap: 18px;
+      gap: 16px;
+      min-width: 0;
     }
     .hero-monogram {
-      width: 68px;
-      height: 68px;
+      width: 64px;
+      height: 64px;
       border-radius: 50%;
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 28px;
+      font-size: 26px;
       font-weight: 600;
       color: #FFFFFF;
       box-shadow: 0 4px 14px rgba(0, 0, 0, 0.10);
+      flex-shrink: 0;
     }
     .hero-name {
       margin: 0;
-      font-size: 30px;
+      font-size: 28px;
       font-weight: 700;
       letter-spacing: -0.022em;
     }
     .hero-badges {
       display: flex;
       align-items: center;
-      gap: 8px;
+      flex-wrap: wrap;
+      gap: 6px;
       margin-top: 6px;
     }
     .hig-tag {
@@ -576,7 +678,7 @@ export function renderFrontendHtml(): string {
       box-shadow: var(--sys-seg-shadow);
     }
 
-    /* Apple Inset Grouped Table View (iOS Settings / Health style) */
+    /* Apple Inset Grouped Table View */
     .table-section-title {
       font-size: 13px;
       font-weight: 600;
@@ -681,7 +783,6 @@ export function renderFrontendHtml(): string {
     .sheet-body {
       padding: 20px 16px 24px;
     }
-    /* iOS Inset Grouped Form Cells */
     .form-group {
       background: var(--sys-bg-secondary);
       border-radius: 12px;
@@ -775,32 +876,70 @@ export function renderFrontendHtml(): string {
     </div>
   </section>
 
-  <!-- ======================== MAIN APPLE SPLIT VIEW ======================== -->
+  <!-- ======================== MAIN WORKSPACE ======================== -->
   <main id="appShell" class="app-workspace">
+
+    <!-- Unified Top Navigation Bar (Always at top on both Desktop & Mobile) -->
+    <header class="global-topbar">
+      <div class="topbar-left">
+        <span class="app-title">关系手记</span>
+      </div>
+
+      <div class="topbar-metrics" id="islandMetrics"></div>
+
+      <div class="topbar-actions">
+        <!-- New Person (SF Symbol: person.badge.plus) -->
+        <button id="openCreatePersonBtn" class="sf-icon-btn" title="新建联系人" aria-label="新建联系人">
+          <svg viewBox="0 0 24 24">
+            <path d="M15 19v-1.5A3.5 3.5 0 0 0 11.5 14h-5A3.5 3.5 0 0 0 3 17.5V19"/>
+            <circle cx="9" cy="7" r="3.5"/>
+            <path d="M19 8v6M16 11h6"/>
+          </svg>
+        </button>
+
+        <!-- Compose Note (SF Symbol: square.and.pencil) -->
+        <button id="openLogEventBtn" class="sf-icon-btn primary" title="记录互动" aria-label="记录互动">
+          <svg viewBox="0 0 24 24">
+            <path d="M11 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-5"/>
+            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+          </svg>
+        </button>
+
+        <!-- Refresh (SF Symbol: arrow.clockwise) -->
+        <button id="refreshBtn" class="sf-icon-btn muted" title="刷新" aria-label="刷新">
+          <svg viewBox="0 0 24 24">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36"/>
+            <path d="M21 3v6h-6"/>
+          </svg>
+        </button>
+
+        <!-- Theme Toggle (SF Symbol: circle.lefthalf.filled / moon.stars) -->
+        <button id="themeToggleBtn" class="sf-icon-btn muted" title="切换深浅外观" aria-label="切换深浅外观">
+          <svg viewBox="0 0 24 24">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+          </svg>
+        </button>
+
+        <!-- Lock / Sign Out (SF Symbol: lock.fill) -->
+        <button id="logoutBtn" class="sf-icon-btn muted" title="锁定并退出" aria-label="锁定并退出">
+          <svg viewBox="0 0 24 24">
+            <rect x="4" y="11" width="16" height="10" rx="2"/>
+            <path d="M8 11V7a4 4 0 0 1 8 0v4"/>
+          </svg>
+        </button>
+      </div>
+    </header>
+
     <div class="split-view">
 
-      <!-- Left Translucent Sidebar -->
+      <!-- Left Translucent Sidebar: Single Unified Contact List Sorted by Priority -->
       <aside class="hig-sidebar">
-        <div class="sidebar-toolbar">
-          <span class="sidebar-title">关系手记</span>
-          <button id="openCreatePersonBtn" class="hig-text-btn bold" title="新建联系人">＋ 新建</button>
-        </div>
-
         <div class="search-field">
           <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path stroke-linecap="round" d="M20 20l-3.5-3.5"/></svg>
           <input id="searchInput" type="search" placeholder="搜索联系人" />
         </div>
 
-        <!-- Priority Attention Section -->
-        <div id="priorityPanel" style="display:none;">
-          <div class="sidebar-group-label">
-            <span>优先关怀</span>
-            <span id="priorityCountBadge">0</span>
-          </div>
-          <div class="inset-group" id="priorityQueueList"></div>
-        </div>
-
-        <!-- Disambiguation Queue Section -->
+        <!-- Disambiguation Queue Section (Only visible when pending > 0) -->
         <div id="disambiguationPanel" style="display:none;">
           <div class="sidebar-group-label">
             <span>待消歧笔记</span>
@@ -809,11 +948,15 @@ export function renderFrontendHtml(): string {
           <div id="disambiguationList"></div>
         </div>
 
-        <!-- All Contacts Section -->
+        <!-- Unified Contacts List (Priority-pinned & Color-coded) -->
         <div>
           <div class="sidebar-group-label">
-            <span>全部联系人</span>
-            <span id="totalContactsCount">0</span>
+            <span>联系人 (<span id="totalContactsCount">0</span>)</span>
+            <span class="legend-dots">
+              <span><i style="background:var(--apple-red);"></i>失联</span>
+              <span><i style="background:var(--apple-orange);"></i>关注</span>
+              <span><i style="background:var(--apple-green);"></i>健康</span>
+            </span>
           </div>
           <div class="inset-group" id="peopleList"></div>
         </div>
@@ -821,19 +964,9 @@ export function renderFrontendHtml(): string {
 
       <!-- Right Detail Stage -->
       <section class="detail-stage">
-        <header class="detail-navbar">
-          <div class="navbar-stats" id="islandMetrics"></div>
-          <div class="navbar-actions">
-            <button id="openLogEventBtn" class="hig-pill-btn filled">＋ 记一笔</button>
-            <button id="themeToggleBtn" class="hig-pill-btn" title="切换外观">外观</button>
-            <button id="refreshBtn" class="hig-pill-btn" title="刷新数据">刷新</button>
-            <button id="logoutBtn" class="hig-text-btn" style="color:var(--sys-label-secondary);">退出</button>
-          </div>
-        </header>
-
         <div class="detail-container" id="inspectorContent">
           <div style="padding: 80px 20px; text-align: center; color: var(--sys-label-secondary);">
-            从左侧选择一位联系人查看健康摘要，或点击「＋ 新建」添加首位联系人。
+            从列表选择一位联系人查看健康摘要，或点击顶部右上角新建联系人。
           </div>
         </div>
       </section>
@@ -963,7 +1096,6 @@ export function renderFrontendHtml(): string {
     let cachedPeople = [];
     let searchQuery = '';
 
-    /* Apple Contacts Pastel-to-Rich Monogram Gradients */
     const AVATAR_GRADIENTS = [
       'linear-gradient(180deg, #5E5CE6 0%, #3634A3 100%)',
       'linear-gradient(180deg, #007AFF 0%, #0051A8 100%)',
@@ -1170,7 +1302,7 @@ export function renderFrontendHtml(): string {
 
     async function enterApp() {
       document.getElementById('authScreen').style.display = 'none';
-      document.getElementById('appShell').style.display = 'block';
+      document.getElementById('appShell').style.display = 'flex';
       await loadPortfolio();
     }
 
@@ -1185,12 +1317,6 @@ export function renderFrontendHtml(): string {
       return map[state] || state;
     }
 
-    function dotColor(score) {
-      if (score >= 70) return 'var(--apple-green)';
-      if (score >= 45) return 'var(--apple-orange)';
-      return 'var(--apple-red)';
-    }
-
     function energyLabel(state) {
       const map = {
         nourishing: '滋养型',
@@ -1202,31 +1328,71 @@ export function renderFrontendHtml(): string {
       return map[state] || state;
     }
 
+    /* Priority Rank: at_risk (0) -> attention_needed (1) -> healthy (2) -> dormant (3) */
+    function priorityWeight(riskLevel) {
+      if (riskLevel === 'at_risk') return 0;
+      if (riskLevel === 'attention_needed') return 1;
+      if (riskLevel === 'healthy') return 2;
+      return 3;
+    }
+
+    function sortPeopleByPriority(list) {
+      return [...list].sort((a, b) => {
+        const wa = priorityWeight(a.risk_level);
+        const wb = priorityWeight(b.risk_level);
+        if (wa !== wb) return wa - wb;
+        return (a.composite_health_score ?? 0) - (b.composite_health_score ?? 0);
+      });
+    }
+
+    function rowPriorityClass(riskLevel) {
+      if (riskLevel === 'at_risk') return 'priority-risk';
+      if (riskLevel === 'attention_needed') return 'priority-warn';
+      return '';
+    }
+
+    function rowStatusBadgeHtml(p) {
+      const score = Math.round(p.composite_health_score ?? 0);
+      if (p.risk_level === 'at_risk') {
+        return '<span class="priority-pill risk">待关怀 · ' + score + '</span>';
+      }
+      if (p.risk_level === 'attention_needed') {
+        return '<span class="priority-pill warn">需关注 · ' + score + '</span>';
+      }
+      if (p.risk_level === 'dormant') {
+        return '<span class="priority-pill muted">归档</span>';
+      }
+      return '<span class="priority-pill ok">' + score + '</span>';
+    }
+
     function renderPeopleSidebar() {
       const plEl = document.getElementById('peopleList');
-      const filtered = cachedPeople.filter((p) =>
+      const sorted = sortPeopleByPriority(cachedPeople);
+      const filtered = sorted.filter((p) =>
         !searchQuery || String(p.alias || '').toLowerCase().includes(searchQuery)
       );
       document.getElementById('totalContactsCount').textContent = String(filtered.length);
 
       if (filtered.length === 0) {
-        plEl.innerHTML = '<div style="padding:18px 14px; font-size:13.5px; color:var(--sys-label-secondary); text-align:center;">无匹配联系人</div>';
+        plEl.innerHTML = '<div style="padding:18px 14px; font-size:13.5px; color:var(--sys-label-secondary); text-align:center;">暂无联系人，点击顶部右上角人物图标新建</div>';
         return;
       }
 
-      plEl.innerHTML = filtered.map((p) => (
-        '<div class="contact-row ' + (selectedPersonId === p.person_id ? 'selected' : '') + '" data-id="' + escapeHtml(p.person_id) + '">' +
-          '<div class="monogram" style="background:' + avatarGradient(p.alias) + ';">' + escapeHtml(p.alias.slice(0, 1)) + '</div>' +
-          '<div class="row-main">' +
-            '<div class="row-title">' + escapeHtml(p.alias) + '</div>' +
-            '<div class="row-sub">' + escapeHtml(stateLabel(p.relationship_state)) + ' · ' + p.event_count + ' 条记录</div>' +
-          '</div>' +
-          '<div class="row-score">' +
-            '<span class="status-dot" style="background:' + dotColor(p.composite_health_score) + ';"></span>' +
-            '<span>' + Math.round(p.composite_health_score) + '</span>' +
-          '</div>' +
-        '</div>'
-      )).join('');
+      plEl.innerHTML = filtered.map((p) => {
+        const gapText = p.days_since_last_interaction !== null && p.days_since_last_interaction !== undefined
+          ? (p.days_since_last_interaction === 0 ? '今天已联系' : p.days_since_last_interaction + ' 天前联系')
+          : '尚无互动';
+        return (
+          '<div class="contact-row ' + rowPriorityClass(p.risk_level) + ' ' + (selectedPersonId === p.person_id ? 'selected' : '') + '" data-id="' + escapeHtml(p.person_id) + '">' +
+            '<div class="monogram" style="background:' + avatarGradient(p.alias) + ';">' + escapeHtml(p.alias.slice(0, 1)) + '</div>' +
+            '<div class="row-main">' +
+              '<div class="row-title">' + escapeHtml(p.alias) + '</div>' +
+              '<div class="row-sub">' + escapeHtml(stateLabel(p.relationship_state)) + ' · ' + gapText + '</div>' +
+            '</div>' +
+            rowStatusBadgeHtml(p) +
+          '</div>'
+        );
+      }).join('');
 
       plEl.querySelectorAll('.contact-row[data-id]').forEach((el) => {
         el.addEventListener('click', () => selectPerson(el.getAttribute('data-id')));
@@ -1239,39 +1405,21 @@ export function renderFrontendHtml(): string {
         mcpToolCall('manage_disambiguation_item', { action: 'list', status: 'pending' })
       ]);
 
-      cachedPeople = (overview.people_summary || []).filter((p) => !isTestRecord(p));
-      const pq = (overview.priority_attention_queue || []).filter((p) => !isTestRecord(p));
+      cachedPeople = sortPeopleByPriority(
+        (overview.people_summary || []).filter((p) => !isTestRecord(p))
+      );
       const dqItems = ((disambig && disambig.items) || []).filter(
         (d) => !String(d.sanitizedContent || '').startsWith('[TEST_DATA]')
       );
 
+      const urgentCount = cachedPeople.filter(
+        (p) => p.risk_level === 'at_risk' || p.risk_level === 'attention_needed'
+      ).length;
+
       document.getElementById('islandMetrics').innerHTML =
         '<span>联系人 <b>' + cachedPeople.length + '</b></span>' +
-        '<span>有效信号 <b>' + overview.totals.active_signals + '</b></span>' +
-        '<span>历史变迁 <b>' + overview.totals.superseded_signals + '</b></span>';
-
-      // Priority Attention Section
-      const priorityPanel = document.getElementById('priorityPanel');
-      if (pq.length === 0) {
-        priorityPanel.style.display = 'none';
-      } else {
-        priorityPanel.style.display = 'block';
-        document.getElementById('priorityCountBadge').textContent = String(pq.length);
-        const pqEl = document.getElementById('priorityQueueList');
-        pqEl.innerHTML = pq.map((p) => (
-          '<div class="contact-row" data-id="' + escapeHtml(p.person_id) + '">' +
-            '<div class="monogram" style="background:' + avatarGradient(p.alias) + ';">' + escapeHtml(p.alias.slice(0, 1)) + '</div>' +
-            '<div class="row-main">' +
-              '<div class="row-title">' + escapeHtml(p.alias) + '</div>' +
-              '<div class="row-sub">已间隔 ' + (p.days_since_last_interaction ?? '—') + ' 天</div>' +
-            '</div>' +
-            '<div class="row-score" style="color:var(--apple-orange);">' + Math.round(p.freshness_score) + '%</div>' +
-          '</div>'
-        )).join('');
-        pqEl.querySelectorAll('.contact-row[data-id]').forEach((el) => {
-          el.addEventListener('click', () => selectPerson(el.getAttribute('data-id')));
-        });
-      }
+        (urgentCount > 0 ? '<span style="color:var(--apple-orange);">优先关怀 <b>' + urgentCount + '</b></span>' : '') +
+        '<span>有效信号 <b>' + overview.totals.active_signals + '</b></span>';
 
       // Populate form dropdown
       const selectEl = document.getElementById('iePersonId');
@@ -1297,8 +1445,8 @@ export function renderFrontendHtml(): string {
               '<option value="">指定归属联系人...</option>' + peopleOptionsHtml +
             '</select>' +
             '<div style="display:flex; gap:8px;">' +
-              '<button type="button" class="hig-pill-btn filled dq-resolve-btn" data-qid="' + escapeHtml(item.id) + '" style="flex:1; justify-content:center;">归属入库</button>' +
-              '<button type="button" class="hig-pill-btn dq-dismiss-btn" data-qid="' + escapeHtml(item.id) + '" style="flex:1; justify-content:center;">忽略</button>' +
+              '<button type="button" class="hig-btn-primary dq-resolve-btn" data-qid="' + escapeHtml(item.id) + '" style="padding:7px 10px; font-size:13px; border-radius:8px;">归属入库</button>' +
+              '<button type="button" class="hig-text-btn dq-dismiss-btn" data-qid="' + escapeHtml(item.id) + '" style="flex-shrink:0; font-size:13px; color:var(--sys-label-secondary);">忽略</button>' +
             '</div>' +
           '</div>'
         )).join('');
@@ -1464,11 +1612,17 @@ export function renderFrontendHtml(): string {
               '<h2 class="hero-name">' + escapeHtml(analysis.person.alias) + '</h2>' +
               '<div class="hero-badges">' +
                 '<span class="hig-tag">' + escapeHtml(stateLabel(analysis.person.relationship_state)) + '</span>' +
-                '<span class="hig-tag">目标周期 ' + h.target_cadence_days + ' 天</span>' +
+                '<span class="hig-tag">周期 ' + h.target_cadence_days + ' 天</span>' +
+                rowStatusBadgeHtml({ risk_level: h.risk_level, composite_health_score: h.composite_health_score }) +
               '</div>' +
             '</div>' +
           '</div>' +
-          '<button type="button" id="quickLogForPersonBtn" class="hig-pill-btn filled">＋ 记一笔互动</button>' +
+          '<button type="button" id="quickLogForPersonBtn" class="sf-icon-btn primary" title="为该联系人记录互动" aria-label="记录互动">' +
+            '<svg viewBox="0 0 24 24">' +
+              '<path d="M11 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-5"/>' +
+              '<path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>' +
+            '</svg>' +
+          '</button>' +
         '</div>' +
 
         /* Apple Health Summary Cards */
