@@ -1,7 +1,8 @@
 import { and, asc, desc, eq, isNull, sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/d1';
 import { z } from 'zod';
-import { D1IngestStore, IngestPayloadSchema, ingestEvent } from './pipeline';
+import { createStablePiiRedactor } from './pii';
+import { D1IngestStore, IngestPayloadSchema, ingestEvent, planSignalWrite } from './pipeline';
 import * as schema from './schema';
 
 export interface McpRuntimeEnv {
@@ -13,9 +14,13 @@ export interface McpRuntimeEnv {
 export interface McpToolDefinition {
   name:
     | 'create_person'
+    | 'update_person'
     | 'query_relationship_records'
     | 'insert_relationship_event'
+    | 'manage_signals'
+    | 'ingest_voice_memo'
     | 'analyze_relationship'
+    | 'synthesize_narrative'
     | 'manage_disambiguation_item';
   description: string;
   inputSchema: Record<string, unknown>;
@@ -23,10 +28,10 @@ export interface McpToolDefinition {
 
 export const MCP_SERVER_INSTRUCTIONS = [
   'Relationship Journal MCP — AI Usage Playbook:',
-  '1. ENTITY RESOLUTION FIRST: Before logging an event or creating a person, call `query_relationship_records` (with no `person_id`) to check existing contacts and resolve their `person_id`. Only call `create_person` for a genuinely new contact.',
-  '2. TURN LOGS INTO BITEMPORAL SIGNALS: Avoid logging bare timeline text when durable facts are present. Whenever a note reveals a preference, a gift clue, or a personal boundary/allergy/taboo, extract `signal_topic` (normalized snake_case like `beverage_preference`, `dietary_allergy`, `wrist_watch_wish`), `signal_value`, and `signal_category` (`preference` | `gift_idea` | `boundary`), plus `sentiment_score` (-1.0 to 1.0). Reusing the same `signal_topic` when a person changes their mind automatically closes the old bitemporal interval (`valid_to`) and links `superseded_by`.',
-  '3. ANTI-POISONING CONFIDENCE & DISAMBIGUATION WORKFLOW: `confidence` (0.0-1.0) measures Entity Attribution / Coreference certainty (whether the note truly belongs to `person_id`). Use `>= 0.85` only when person attribution is unambiguous. When pronouns or nicknames are ambiguous, submit `< 0.85` (or `person_id: null`) so the note is safely isolated in `disambiguation_queue`. Later, use `manage_disambiguation_item` with `action: "list"` to review pending ambiguous notes with the user, `action: "resolve"` (or `"link"`) to attribute an item to a confirmed `person_id` and persist its timeline event/bitemporal signal, or `action: "dismiss"` to discard noise.',
-  '4. QUANTITATIVE DECISION MAKING: Use `analyze_relationship` (omit `person_id`) to surface `priority_attention_queue` (who to reach out to right now based on exponential decay `freshness_score` and `overdue_ratio`). Before the user meets or buys a gift for someone, call `analyze_relationship` with `person_id` to inspect `cadence.drift_z_score` (unusual silence), `sentiment.energy_state` (`nourishing` vs `cooling_warning` vs `draining`), `signals.preference_changes` (avoid outdated habits), and `depth_and_volatility.missing_dimensions` (suggest conversation topics to fill missing `boundary` or `gift_idea` knowledge).',
+  '1. ENTITY RESOLUTION & PROFILE LIFECYCLE: Before logging an event or creating a person, call `query_relationship_records` (with no `person_id`) to check existing contacts. Call `create_person` only for a new contact, and use `update_person` (`manage_profile`) whenever a contact changes `relationship_state` (e.g., `lover` -> `discernment`, `active` -> `close`), alias, or `key_dates`/tags.',
+  '2. TURN LOGS & VOICE MEMOS INTO BITEMPORAL SIGNALS: For raw Whisper voice transcripts or chat logs, call `ingest_voice_memo` (`commit: false` first to preview PII redaction, contact attribution, and extracted candidate signals, then `commit: true` or `insert_relationship_event` after confirmation). For direct preference/boundary management without logging an event, use `manage_signals` (`query`, `override`/`upsert`, or `supersede`/`retire`).',
+  '3. ANTI-POISONING CONFIDENCE & DISAMBIGUATION WORKFLOW: `confidence` (0.0-1.0) measures Entity Attribution / Coreference certainty. Use `>= 0.85` only when person attribution is unambiguous. When pronouns or nicknames are ambiguous, submit `< 0.85` (or `person_id: null`) so the note is isolated in `disambiguation_queue`, then use `manage_disambiguation_item` (`list`, `resolve`/`link`, `dismiss`).',
+  '4. QUANTITATIVE DECISION MAKING & STORYBOOK SYNTHESIS: Use `analyze_relationship` to inspect `freshness_score`, `drift_z_score`, `sentiment.ema`, and `priority_attention_queue`. Use `synthesize_narrative` (`monthly_recap`) with `person_id` and `month` (YYYY-MM) to generate a bitemporal monthly story summary with ready-to-run Flux illustration prompts and ElevenLabs narration scripts.',
 ].join('\n');
 
 export const MCP_TOOLS: McpToolDefinition[] = [
@@ -64,6 +69,48 @@ export const MCP_TOOLS: McpToolDefinition[] = [
           additionalProperties: { type: ['string', 'boolean', 'number'] },
           description:
             'Key dates in YYYY-MM-DD format (e.g., {"birthday":"1995-06-15","anniversary":"2023-09-10","met_at":"2022-04-01"}). Recurring keys `birthday` and `anniversary` trigger automatic upcoming countdown hooks.',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'update_person',
+    description:
+      'Update an existing person profile (`manage_profile`) in D1: transition `relationship_state` (e.g. from `lover` to `discernment`, `active` to `close`, or `reconnect_needed`), rename `alias`, or merge/replace `key_dates` and tags. When `merge_key_dates: true` (default), existing keys are preserved and setting a key to `null` or `""` deletes it.',
+    inputSchema: {
+      type: 'object',
+      required: ['person_id'],
+      properties: {
+        person_id: {
+          type: 'string',
+          minLength: 1,
+          description: 'Target person ID to update.',
+        },
+        alias: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 200,
+          description: 'Optional updated display alias.',
+        },
+        relationship_state: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 64,
+          description:
+            'Optional new relationship state (e.g., `lover`, `discernment`, `close`, `active`, `reconnect_needed`, `casual`, `archived`).',
+        },
+        key_dates: {
+          type: 'object',
+          additionalProperties: { type: ['string', 'boolean', 'number', 'null'] },
+          description:
+            'Key dates, tags, or metadata to merge or replace (e.g., {"birthday":"1996-05-20","tag":"art_circle","old_tag":null}).',
+        },
+        merge_key_dates: {
+          type: 'boolean',
+          default: true,
+          description:
+            'When true (default), merges `key_dates` into existing `key_dates` (keys set to null or empty string are removed). Set false to overwrite `key_dates` completely.',
         },
       },
       additionalProperties: false,
@@ -176,6 +223,118 @@ export const MCP_TOOLS: McpToolDefinition[] = [
     },
   },
   {
+    name: 'manage_signals',
+    description:
+      'Explicitly query, override/upsert, or supersede/retire bitemporal boundaries, preferences, and gift ideas without needing to insert a timeline event. ACTIONS: (1) `action: "query"` fetches active signals, full bitemporal history (`include_history: true`), or point-in-time valid signals at `as_of` (ISO-8601). (2) `action: "override"` or `"upsert"` directly writes or updates a `(person_id, topic, value, category)` signal using bitemporal interval planning and Layer-1 PII redaction. (3) `action: "supersede"` or `"retire"` explicitly closes an active signal (`valid_to` set to `effective_at`), optionally replacing it if `new_value` is provided.',
+    inputSchema: {
+      type: 'object',
+      required: ['person_id'],
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['query', 'override', 'upsert', 'supersede', 'retire'],
+          default: 'query',
+          description:
+            '`query` to inspect signals (including point-in-time `as_of`), `override`/`upsert` to directly set a preference or boundary, or `supersede`/`retire` to close an obsolete signal.',
+        },
+        person_id: {
+          type: 'string',
+          minLength: 1,
+          description: 'Target person ID.',
+        },
+        category: {
+          type: 'string',
+          enum: ['gift_idea', 'preference', 'boundary'],
+          description: 'Signal category (`preference`, `gift_idea`, or `boundary`).',
+        },
+        topic: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 128,
+          description: 'Normalized snake_case signal topic (e.g. `beverage_preference`, `late_night_boundary`).',
+        },
+        value: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 512,
+          description: 'Signal value when `action` is `override` or `upsert`.',
+        },
+        new_value: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 512,
+          description: 'Optional replacement value when `action` is `supersede`. Omit to retire the signal without a replacement.',
+        },
+        content: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 2000,
+          description: 'Optional context note for the signal (PII redacted before storage).',
+        },
+        signal_id: {
+          type: 'string',
+          description: 'Optional specific signal ID to close when `action` is `supersede` or `retire`.',
+        },
+        include_history: {
+          type: 'boolean',
+          default: false,
+          description: 'When `action: "query"`, include superseded historical signals (`valid_to IS NOT NULL`).',
+        },
+        as_of: {
+          type: 'string',
+          format: 'date-time',
+          description: 'Optional ISO-8601 timestamp for point-in-time bitemporal query (`valid_from <= as_of < valid_to`).',
+        },
+        effective_at: {
+          type: 'string',
+          format: 'date-time',
+          description: 'Optional ISO-8601 valid-time timestamp for `override`, `upsert`, `supersede`, or `retire` (defaults to current server time).',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'ingest_voice_memo',
+    description:
+      'Ingest a raw Whisper voice memo transcript or multi-line chat log (`raw_log`): automatically runs Layer-1 PII redaction, matches contact aliases in D1 to estimate coreference `confidence`, scores emotional sentiment, and extracts candidate bitemporal signals (`preference`, `gift_idea`, `boundary`). By default (`commit: false`), returns a structured extraction `draft` with ready-to-submit `draft_ingest_payloads` for confirmation; set `commit: true` to persist immediately.',
+    inputSchema: {
+      type: 'object',
+      required: ['raw_text'],
+      properties: {
+        raw_text: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 20000,
+          description: 'Raw Whisper voice transcript or chat log text.',
+        },
+        person_id: {
+          type: ['string', 'null'],
+          description:
+            'Optional known person ID. If omitted, the worker scans `raw_text` against contact aliases in D1 and computes attribution confidence.',
+        },
+        source: {
+          type: 'string',
+          enum: ['voice_note', 'chat_log', 'manual'],
+          default: 'voice_note',
+          description: 'Origin channel (`voice_note` default for Whisper transcripts, or `chat_log`).',
+        },
+        occurred_at: {
+          type: 'string',
+          format: 'date-time',
+          description: 'Optional ISO-8601 timestamp when the voice memo or conversation took place.',
+        },
+        commit: {
+          type: 'boolean',
+          default: false,
+          description:
+            'False (default) returns the PII-sanitized draft and extracted signals for user review without writing to D1. Set true to immediately persist the extracted event and signals.',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: 'analyze_relationship',
     description:
       'Run quantitative relationship intelligence and diagnostic models. TWO MODES: (1) Omit `person_id` (`mode: "portfolio_overview"`) when the user asks "Who should I contact?", "How are my relationships doing?", or during weekly reviews—returns `priority_attention_queue` sorted by lowest `composite_health_score` to highlight contacts with high decay (`overdue_ratio`) or `at_risk` status. (2) Pass `person_id` (`mode: "person_analysis"`) before a meeting, catch-up, or gift decision—returns `health` (`freshness_score` 0-100, `composite_health_score` 0-100, `overdue_ratio`, `risk_level`), `cadence` (`mean_interval_days`, `drift_z_score`, `cadence_anomaly` when silence Z-score > 2.0), `sentiment` (`ema`, `momentum_slope`, `energy_state`: `nourishing` | `neutral` | `cooling_warning` | `draining`), `depth_and_volatility` (`signal_yield_rate`, `profile_coverage_score`, `missing_dimensions`, `volatility_90d`, `churn_rate`), `signals.preference_changes` (bitemporal old->new shifts), `upcoming_key_dates`, and actionable `follow_up_hooks`.',
@@ -186,6 +345,41 @@ export const MCP_TOOLS: McpToolDefinition[] = [
           type: 'string',
           description:
             'Target person ID for deep quantitative diagnosis (`mode: "person_analysis"`). Omit for a global portfolio dashboard and `priority_attention_queue` (`mode: "portfolio_overview"`).',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'synthesize_narrative',
+    description:
+      'Generate a periodic or monthly relationship narrative recap (`monthly_recap`) for a person by pulling their valid bitemporal timeline and signal evolution for `month` (YYYY-MM). Returns an emotional arc analysis, narrative summary, chapter-by-chapter storybook scenes, ready-to-use Flux illustration prompts (`flux_image_prompt`), and ElevenLabs expressive TTS scripts (`elevenlabs_tts`).',
+    inputSchema: {
+      type: 'object',
+      required: ['person_id'],
+      properties: {
+        person_id: {
+          type: 'string',
+          minLength: 1,
+          description: 'Target person ID.',
+        },
+        month: {
+          type: 'string',
+          pattern: '^\\d{4}-(0[1-9]|1[0-2])$',
+          description:
+            'Target month in YYYY-MM format (e.g. `2026-11`). Omit to auto-select the month of the latest interaction.',
+        },
+        style: {
+          type: 'string',
+          enum: ['storybook', 'cinematic', 'warm_journal', 'minimalist'],
+          default: 'storybook',
+          description: 'Visual and narrative style for Flux prompts and storybook chapters.',
+        },
+        language: {
+          type: 'string',
+          enum: ['zh', 'en'],
+          default: 'zh',
+          description: 'Language for narrative summary and ElevenLabs voice scripts (`zh` or `en`).',
         },
       },
       additionalProperties: false,
@@ -1310,6 +1504,913 @@ async function runManageDisambiguationTool(rawArgs: unknown, env: McpRuntimeEnv)
   });
 }
 
+const UpdatePersonArgsSchema = z.object({
+  person_id: z.string().trim().min(1).max(128),
+  alias: z.string().trim().min(1).max(200).optional(),
+  relationship_state: z.string().trim().min(1).max(64).optional(),
+  key_dates: z
+    .record(z.string(), z.union([z.string(), z.boolean(), z.number(), z.null()]))
+    .optional(),
+  merge_key_dates: z.boolean().default(true),
+});
+
+async function runUpdatePersonTool(rawArgs: unknown, env: McpRuntimeEnv) {
+  const parsed = UpdatePersonArgsSchema.safeParse(rawArgs);
+  if (!parsed.success) {
+    return toolResult({ error: 'Invalid arguments', details: parsed.error.flatten() }, true);
+  }
+
+  const data = parsed.data;
+  if (
+    data.alias === undefined &&
+    data.relationship_state === undefined &&
+    data.key_dates === undefined
+  ) {
+    return toolResult(
+      {
+        error:
+          'At least one field (alias, relationship_state, or key_dates) must be provided to update_person',
+      },
+      true
+    );
+  }
+
+  const db = drizzle(env.DB, { schema });
+  const [person] = await db
+    .select()
+    .from(schema.people)
+    .where(eq(schema.people.id, data.person_id))
+    .limit(1);
+
+  if (!person || isSyntheticTestPerson(person)) {
+    return toolResult({ status: 'not_found', error: 'Person not found', person_id: data.person_id }, true);
+  }
+
+  const nextAlias = data.alias ?? person.alias;
+  const nextState = data.relationship_state ?? person.relationshipState;
+  let nextKeyDates: Record<string, unknown> = { ...(person.keyDates ?? {}) };
+
+  if (data.key_dates !== undefined) {
+    if (data.merge_key_dates) {
+      for (const [k, v] of Object.entries(data.key_dates)) {
+        if (v === null || v === '') {
+          delete nextKeyDates[k];
+        } else {
+          nextKeyDates[k] = v;
+        }
+      }
+    } else {
+      nextKeyDates = {};
+      for (const [k, v] of Object.entries(data.key_dates)) {
+        if (v !== null && v !== '') {
+          nextKeyDates[k] = v;
+        }
+      }
+    }
+  }
+
+  await db
+    .update(schema.people)
+    .set({
+      alias: nextAlias,
+      relationshipState: nextState,
+      keyDates: nextKeyDates,
+    })
+    .where(eq(schema.people.id, person.id));
+
+  return toolResult({
+    status: 'updated',
+    previous: {
+      alias: person.alias,
+      relationship_state: person.relationshipState,
+      key_dates: person.keyDates ?? {},
+    },
+    person: {
+      id: person.id,
+      alias: nextAlias,
+      relationship_state: nextState,
+      key_dates: nextKeyDates,
+      created_at: person.createdAt,
+    },
+  });
+}
+
+const ManageSignalsArgsSchema = z.object({
+  action: z.enum(['query', 'override', 'upsert', 'supersede', 'retire']).default('query'),
+  person_id: z.string().trim().min(1),
+  category: z.enum(['gift_idea', 'preference', 'boundary']).optional(),
+  topic: z.string().trim().min(1).max(128).optional(),
+  value: z.string().trim().min(1).max(512).optional(),
+  new_value: z.string().trim().min(1).max(512).optional(),
+  content: z.string().trim().min(1).max(2000).optional(),
+  signal_id: z.string().trim().min(1).optional(),
+  include_history: z.boolean().default(false),
+  as_of: z.string().datetime({ offset: true }).optional(),
+  effective_at: z.string().datetime({ offset: true }).optional(),
+});
+
+async function runManageSignalsTool(rawArgs: unknown, env: McpRuntimeEnv, nowMs = Date.now()) {
+  const parsed = ManageSignalsArgsSchema.safeParse(rawArgs);
+  if (!parsed.success) {
+    return toolResult({ error: 'Invalid arguments', details: parsed.error.flatten() }, true);
+  }
+
+  const data = parsed.data;
+  const db = drizzle(env.DB, { schema });
+  const [person] = await db
+    .select()
+    .from(schema.people)
+    .where(eq(schema.people.id, data.person_id))
+    .limit(1);
+
+  if (!person || isSyntheticTestPerson(person)) {
+    return toolResult({ status: 'not_found', error: 'Person not found', person_id: data.person_id }, true);
+  }
+
+  const nowIso = new Date(nowMs).toISOString();
+
+  if (data.action === 'query') {
+    const conditions = [eq(schema.signals.personId, data.person_id)];
+    if (data.category) {
+      conditions.push(eq(schema.signals.category, data.category));
+    }
+    if (data.topic) {
+      conditions.push(eq(schema.signals.topic, data.topic));
+    }
+
+    const allRows = await db
+      .select()
+      .from(schema.signals)
+      .where(and(...conditions))
+      .orderBy(desc(schema.signals.validFrom));
+
+    let filtered = allRows;
+    if (data.as_of) {
+      const asOfMs = Date.parse(data.as_of);
+      filtered = allRows.filter((s) => {
+        const fromMs = Date.parse(s.validFrom);
+        const toMs = s.validTo === null ? Number.POSITIVE_INFINITY : Date.parse(s.validTo);
+        return fromMs <= asOfMs && asOfMs < toMs;
+      });
+    } else if (!data.include_history) {
+      filtered = allRows.filter((s) => s.validTo === null);
+    }
+
+    return toolResult({
+      mode: 'query_signals',
+      person_id: person.id,
+      alias: person.alias,
+      as_of: data.as_of ?? null,
+      include_history: data.include_history,
+      category_filter: data.category ?? null,
+      topic_filter: data.topic ?? null,
+      count: filtered.length,
+      signals: filtered,
+    });
+  }
+
+  if (!env.PII_TOKEN_KEY && env.ENVIRONMENT !== 'development') {
+    return toolResult(
+      {
+        error: 'Service misconfigured: PII_TOKEN_KEY secret is not set; refusing to store PII tokens.',
+      },
+      true
+    );
+  }
+
+  const writeOverrideSignal = async (
+    topicInput: string,
+    valueInput: string,
+    categoryInput: 'gift_idea' | 'preference' | 'boundary',
+    contentInput: string | undefined,
+    effectiveAt: string
+  ) => {
+    const rawContent =
+      contentInput ?? `Explicit ${categoryInput} signal (${topicInput}): ${valueInput}`;
+    const redactor = await createStablePiiRedactor(
+      [topicInput, valueInput, rawContent],
+      env.PII_TOKEN_KEY
+    );
+    const cleanTopic = redactor.redact(topicInput);
+    const cleanValue = redactor.redact(valueInput);
+    const cleanContent = redactor.redact(rawContent);
+    const { redacted_entities } = redactor.summary();
+
+    const store = new D1IngestStore(env.DB);
+    const history = await store.getSignalHistory(person.id, cleanTopic);
+    const newSignalId = `sig_${crypto.randomUUID()}`;
+    const plan = planSignalWrite({
+      history,
+      personId: person.id,
+      topic: cleanTopic,
+      value: cleanValue,
+      category: categoryInput,
+      content: cleanContent,
+      occurredAt: effectiveAt,
+      recordedAt: nowIso,
+      newSignalId,
+    });
+
+    if (plan.mutation.kind === 'none') {
+      return toolResult({
+        status: 'unchanged',
+        action: data.action,
+        person_id: person.id,
+        topic: cleanTopic,
+        value: cleanValue,
+        bitemporal_update: plan.update,
+        redacted_entities,
+      });
+    }
+
+    const statements: D1PreparedStatement[] = [];
+    if (plan.mutation.close) {
+      const c = plan.mutation.close;
+      const closeSql =
+        c.expectedValidTo === null
+          ? 'UPDATE signals SET valid_to = ?, superseded_at = ?, superseded_by = ? WHERE id = ? AND valid_to IS NULL'
+          : 'UPDATE signals SET valid_to = ?, superseded_at = ?, superseded_by = ? WHERE id = ? AND valid_to = ?';
+      const closeStmt =
+        c.expectedValidTo === null
+          ? env.DB.prepare(closeSql).bind(c.validTo, c.supersededAt, c.supersededBy, c.id)
+          : env.DB.prepare(closeSql).bind(
+              c.validTo,
+              c.supersededAt,
+              c.supersededBy,
+              c.id,
+              c.expectedValidTo
+            );
+      statements.push(closeStmt);
+    }
+
+    const ins = plan.mutation.insert;
+    statements.push(
+      env.DB.prepare(
+        'INSERT INTO signals (id, person_id, category, topic, value, content, valid_from, valid_to, recorded_at, superseded_at, superseded_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      ).bind(
+        ins.id,
+        ins.person_id,
+        ins.category,
+        ins.topic,
+        ins.value,
+        ins.content,
+        ins.valid_from,
+        ins.valid_to,
+        ins.recorded_at,
+        ins.superseded_at,
+        ins.superseded_by
+      )
+    );
+
+    await env.DB.batch(statements);
+
+    return toolResult({
+      status: 'updated',
+      action: data.action,
+      person_id: person.id,
+      bitemporal_update: plan.update,
+      signal: ins,
+      redacted_entities,
+    });
+  };
+
+  if (data.action === 'override' || data.action === 'upsert') {
+    const rawValue = data.value ?? data.new_value;
+    if (!data.topic || !rawValue) {
+      return toolResult(
+        { error: 'Both topic and value are required when action is override or upsert' },
+        true
+      );
+    }
+    return writeOverrideSignal(
+      data.topic,
+      rawValue,
+      data.category ?? 'preference',
+      data.content,
+      data.effective_at ?? nowIso
+    );
+  }
+
+  // action === 'supersede' || 'retire'
+  let targetSignal: typeof schema.signals.$inferSelect | undefined;
+  if (data.signal_id) {
+    const [row] = await db
+      .select()
+      .from(schema.signals)
+      .where(and(eq(schema.signals.id, data.signal_id), eq(schema.signals.personId, person.id)))
+      .limit(1);
+    targetSignal = row;
+  } else if (data.topic) {
+    const [row] = await db
+      .select()
+      .from(schema.signals)
+      .where(
+        and(
+          eq(schema.signals.personId, person.id),
+          eq(schema.signals.topic, data.topic),
+          isNull(schema.signals.validTo)
+        )
+      )
+      .limit(1);
+    targetSignal = row;
+  } else {
+    return toolResult(
+      { error: 'Either signal_id or topic is required when action is supersede or retire' },
+      true
+    );
+  }
+
+  if (!targetSignal) {
+    return toolResult(
+      {
+        status: 'not_found',
+        error: 'Target active signal not found',
+        person_id: person.id,
+        signal_id: data.signal_id ?? null,
+        topic: data.topic ?? null,
+      },
+      true
+    );
+  }
+
+  if (targetSignal.validTo !== null) {
+    return toolResult(
+      {
+        status: 'already_superseded',
+        error: 'Signal is already closed/superseded',
+        signal_id: targetSignal.id,
+        valid_to: targetSignal.validTo,
+      },
+      true
+    );
+  }
+
+  const replacementValue = data.new_value ?? data.value;
+  const effectiveAt = data.effective_at ?? nowIso;
+
+  if (replacementValue) {
+    const cat = (
+      data.category ??
+      (targetSignal.category === 'gift_idea' ||
+      targetSignal.category === 'preference' ||
+      targetSignal.category === 'boundary'
+        ? targetSignal.category
+        : 'preference')
+    ) as 'gift_idea' | 'preference' | 'boundary';
+    return writeOverrideSignal(targetSignal.topic, replacementValue, cat, data.content, effectiveAt);
+  }
+
+  // Pure retirement without replacement value
+  const fromMs = Date.parse(targetSignal.validFrom);
+  const requestedEndMs = Date.parse(effectiveAt);
+  const safeValidTo =
+    requestedEndMs > fromMs ? effectiveAt : new Date(fromMs + 1000).toISOString();
+
+  await env.DB.prepare(
+    'UPDATE signals SET valid_to = ?, superseded_at = ? WHERE id = ? AND valid_to IS NULL'
+  )
+    .bind(safeValidTo, nowIso, targetSignal.id)
+    .run();
+
+  return toolResult({
+    status: 'retired',
+    action: data.action,
+    person_id: person.id,
+    retired_signal_id: targetSignal.id,
+    topic: targetSignal.topic,
+    category: targetSignal.category,
+    old_value: targetSignal.value,
+    valid_from: targetSignal.validFrom,
+    valid_to: safeValidTo,
+  });
+}
+
+const IngestVoiceMemoArgsSchema = z.object({
+  raw_text: z.string().trim().min(1).max(20000),
+  person_id: z.string().trim().min(1).nullable().optional(),
+  source: z.enum(['voice_note', 'chat_log', 'manual']).default('voice_note'),
+  occurred_at: z.string().datetime({ offset: true }).optional(),
+  commit: z.boolean().default(false),
+});
+
+interface ExtractedCandidateSignal {
+  category: 'preference' | 'gift_idea' | 'boundary';
+  topic: string;
+  value: string;
+  matched_phrase: string;
+}
+
+function normalizeSignalValueSlug(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^[":：,，.。;；!！?？\s]+|[":：,，.。;；!！?？\s]+$/g, '')
+    .slice(0, 180);
+}
+
+function extractVoiceMemoSignalsAndSentiment(sanitizedText: string): {
+  sentiment_score: number;
+  extracted_signals: ExtractedCandidateSignal[];
+} {
+  const positiveMatches =
+    sanitizedText.match(
+      /开心|愉快|喜欢|感谢|温暖|放松|贴心|期待|投缘|感动|惊喜|舒服|治愈|loves|great|happy|wonderful|excited|grateful|enjoyed|warm|sweet|delighted/gi
+    ) ?? [];
+  const negativeMatches =
+    sanitizedText.match(
+      /累|内耗|吵架|生气|不舒服|焦虑|冷淡|讨厌|冲突|尴尬|疲惫|敷衍|难过|委屈|tired|drained|argued|upset|frustrated|annoyed|stressful|cold|awkward|conflict/gi
+    ) ?? [];
+
+  let sentimentScore = 0.25;
+  if (positiveMatches.length > 0 || negativeMatches.length > 0) {
+    const rawDelta = (positiveMatches.length - negativeMatches.length) * 0.3;
+    sentimentScore = roundScore(Math.max(-0.95, Math.min(0.95, 0.2 + rawDelta)));
+  }
+
+  const signals: ExtractedCandidateSignal[] = [];
+  const seenTopics = new Set<string>();
+
+  const pushUnique = (
+    category: 'preference' | 'gift_idea' | 'boundary',
+    topic: string,
+    rawVal: string,
+    phrase: string
+  ) => {
+    const val = normalizeSignalValueSlug(rawVal);
+    if (!val || seenTopics.has(`${topic}:${val}`)) return;
+    seenTopics.add(`${topic}:${val}`);
+    signals.push({ category, topic, value: val, matched_phrase: phrase.trim() });
+  };
+
+  // 1. Boundary / Allergy / Taboo rules
+  const allergyRegex =
+    /(?:对\s*([^,，.。;；!！\s]{1,24})\s*过敏|(?:allergic to|allergy to)\s+([^,，.。;；!！\n]{2,36}))/gi;
+  for (const m of sanitizedText.matchAll(allergyRegex)) {
+    const item = m[1] ?? m[2];
+    if (item) {
+      pushUnique('boundary', 'dietary_allergy', `allergic_to_${item}`, m[0]);
+    }
+  }
+
+  const boundaryRegex =
+    /(?:(?:忌口|不能吃|不吃|戒了|雷区是|底线是|边界是|讨厌聊|不喜欢被)\s*([^,，.。;；!！\n]{2,40})|(?:quit|stopped drinking|doesn't eat|never eats|hates discussing|boundary around)\s+([^,，.。;；!！\n]{2,40}))/gi;
+  for (const m of sanitizedText.matchAll(boundaryRegex)) {
+    const item = m[1] ?? m[2];
+    if (item) {
+      const isDietary = /吃|喝|酒|咖啡|辣|香菜|海鲜|花生|奶|caffeine|alcohol|meat|dairy|gluten|sugar/i.test(
+        m[0]
+      );
+      pushUnique(
+        'boundary',
+        isDietary ? 'dietary_restriction' : 'personal_boundary',
+        item,
+        m[0]
+      );
+    }
+  }
+
+  // 2. Gift ideas / Wishlist rules
+  const giftRegex =
+    /(?:(?:想要|想买|一直看中|心愿是|礼物想收|种草了)\s*([^,，.。;；!！\n]{2,48})|(?:mentioned wanting|wants a|wishes for|looking to buy|dream gift is|hoping to get)\s+([^,，.。;；!！\n]{2,48}))/gi;
+  for (const m of sanitizedText.matchAll(giftRegex)) {
+    const item = m[1] ?? m[2];
+    if (item) {
+      pushUnique('gift_idea', 'gift_wishlist', item, m[0]);
+    }
+  }
+
+  // 3. Preference rules (beverage, food, activity)
+  const bevRegex =
+    /(?:(?:爱喝|喜欢喝|改喝|只喝|最爱喝|平时喝)\s*([^,，.。;；!！\n]{2,40})|(?:switched to drinking|loves drinking|prefers drinking|favorite drink is|switched to)\s+([^,，.。;；!！\n]{2,40}))/gi;
+  for (const m of sanitizedText.matchAll(bevRegex)) {
+    const item = m[1] ?? m[2];
+    if (item) {
+      pushUnique('preference', 'beverage_preference', item, m[0]);
+    }
+  }
+
+  const prefRegex =
+    /(?:(?:最喜欢|特别喜欢|偏爱|迷上了|爱吃|喜欢吃)\s*([^,，.。;；!！\n]{2,44})|(?:really loves|is obsessed with|prefers|favorite food is|loves eating)\s+([^,，.。;；!！\n]{2,44}))/gi;
+  for (const m of sanitizedText.matchAll(prefRegex)) {
+    const item = m[1] ?? m[2];
+    if (item) {
+      const isFood = /吃|菜|火锅|日料|甜品|面|food|cuisine|ramen|sushi|pasta|dessert/i.test(m[0]);
+      pushUnique(
+        'preference',
+        isFood ? 'food_preference' : 'general_preference',
+        item,
+        m[0]
+      );
+    }
+  }
+
+  return {
+    sentiment_score: sentimentScore,
+    extracted_signals: signals,
+  };
+}
+
+async function runIngestVoiceMemoTool(rawArgs: unknown, env: McpRuntimeEnv, nowMs = Date.now()) {
+  const parsed = IngestVoiceMemoArgsSchema.safeParse(rawArgs);
+  if (!parsed.success) {
+    return toolResult({ error: 'Invalid arguments', details: parsed.error.flatten() }, true);
+  }
+
+  const data = parsed.data;
+  if (!env.PII_TOKEN_KEY && env.ENVIRONMENT !== 'development') {
+    return toolResult(
+      {
+        error: 'Service misconfigured: PII_TOKEN_KEY secret is not set; refusing to store PII tokens.',
+      },
+      true
+    );
+  }
+
+  const db = drizzle(env.DB, { schema });
+  const allPeopleRows = await db.select().from(schema.people).orderBy(asc(schema.people.id));
+  const privatePeople = allPeopleRows.filter((p) => !isSyntheticTestPerson(p));
+
+  // Resolve contact attribution BEFORE redaction so contact aliases in raw_text can be matched
+  let resolvedPerson: (typeof privatePeople)[number] | null = null;
+  let confidence = 0.5;
+  let attributionReason = 'No explicit contact alias matched in transcript';
+
+  if (data.person_id) {
+    const explicit = privatePeople.find((p) => p.id === data.person_id);
+    if (!explicit) {
+      return toolResult(
+        { status: 'not_found', error: 'Provided person_id not found', person_id: data.person_id },
+        true
+      );
+    }
+    resolvedPerson = explicit;
+    confidence = 0.96;
+    attributionReason = 'Explicit person_id provided by caller';
+  } else {
+    const lowerRaw = data.raw_text.toLowerCase();
+    const matchedPeople = privatePeople.filter((p) => {
+      const fullAlias = p.alias.trim().toLowerCase();
+      if (fullAlias.length >= 2 && lowerRaw.includes(fullAlias)) return true;
+      const firstToken = fullAlias.split(/\s+/)[0];
+      return firstToken && firstToken.length >= 2 && lowerRaw.includes(firstToken);
+    });
+
+    if (matchedPeople.length === 1) {
+      resolvedPerson = matchedPeople[0];
+      confidence = 0.91;
+      attributionReason = `Matched contact alias '${matchedPeople[0].alias}' in transcript`;
+    } else if (matchedPeople.length > 1) {
+      resolvedPerson = matchedPeople[0];
+      confidence = 0.65;
+      attributionReason = `Ambiguous transcript: multiple contact aliases matched (${matchedPeople.map((p) => p.alias).join(', ')})`;
+    }
+  }
+
+  const redactor = await createStablePiiRedactor([data.raw_text], env.PII_TOKEN_KEY);
+  const sanitizedText = redactor.redact(data.raw_text);
+  const { redacted_entities } = redactor.summary();
+
+  const { sentiment_score, extracted_signals } = extractVoiceMemoSignalsAndSentiment(sanitizedText);
+  const occurredAt = data.occurred_at ?? new Date(nowMs).toISOString();
+
+  const draftPayloads =
+    extracted_signals.length > 0
+      ? extracted_signals.map((sig) => ({
+          person_id: resolvedPerson?.id ?? null,
+          source: data.source,
+          content: sanitizedText,
+          confidence,
+          sentiment_score,
+          signal_topic: sig.topic,
+          signal_value: sig.value,
+          signal_category: sig.category,
+          occurred_at: occurredAt,
+        }))
+      : [
+          {
+            person_id: resolvedPerson?.id ?? null,
+            source: data.source,
+            content: sanitizedText,
+            confidence,
+            sentiment_score,
+            occurred_at: occurredAt,
+          },
+        ];
+
+  if (!data.commit) {
+    return toolResult({
+      mode: 'draft_preview',
+      committed: false,
+      attribution: {
+        person_id: resolvedPerson?.id ?? null,
+        alias: resolvedPerson?.alias ?? null,
+        confidence,
+        reason: attributionReason,
+        will_route_to_disambiguation: !resolvedPerson || confidence < 0.85,
+      },
+      pii_redaction: {
+        sanitized_text: sanitizedText,
+        redacted_entities,
+      },
+      extracted_event: {
+        source: data.source,
+        summary: sanitizedText.length > 140 ? `${sanitizedText.slice(0, 137)}...` : sanitizedText,
+        sentiment_score,
+        occurred_at: occurredAt,
+      },
+      extracted_signals,
+      draft_ingest_payloads: draftPayloads,
+      next_step:
+        'Present the extracted draft to the user for confirmation, then call ingest_voice_memo with commit:true (or insert_relationship_event) to persist.',
+    });
+  }
+
+  const store = new D1IngestStore(env.DB);
+  const outcomes = [];
+  for (const payload of draftPayloads) {
+    const parsedPayload = IngestPayloadSchema.parse(payload);
+    const outcome = await ingestEvent(parsedPayload, store, undefined, {
+      piiTokenKey: env.PII_TOKEN_KEY,
+    });
+    outcomes.push(outcome);
+  }
+
+  return toolResult({
+    mode: 'committed',
+    committed: true,
+    attribution: {
+      person_id: resolvedPerson?.id ?? null,
+      alias: resolvedPerson?.alias ?? null,
+      confidence,
+      reason: attributionReason,
+    },
+    pii_redaction: {
+      sanitized_text: sanitizedText,
+      redacted_entities,
+    },
+    extracted_signals,
+    ingest_outcomes: outcomes,
+  });
+}
+
+const SynthesizeNarrativeArgsSchema = z.object({
+  person_id: z.string().trim().min(1),
+  month: z
+    .string()
+    .regex(/^\d{4}-(0[1-9]|1[0-2])$/, 'Expected YYYY-MM format')
+    .optional(),
+  style: z.enum(['storybook', 'cinematic', 'warm_journal', 'minimalist']).default('storybook'),
+  language: z.enum(['zh', 'en']).default('zh'),
+});
+
+const STYLE_AESTHETIC_PROMPTS: Record<
+  'storybook' | 'cinematic' | 'warm_journal' | 'minimalist',
+  string
+> = {
+  storybook:
+    'warm editorial storybook illustration, soft gouache and watercolor texture, gentle natural light, expressive character emotion, hand-painted picture book aesthetic',
+  cinematic:
+    '35mm cinematic film still, Kodak Portra 400 grain, shallow depth of field, golden hour rim lighting, intimate atmospheric composition',
+  warm_journal:
+    'cozy sketchbook journal spread, warm ink linework with soft pastel washes, tactile paper grain, intimate memory snapshot',
+  minimalist:
+    'clean modern Apple editorial vector illustration, refined geometric forms, soft ambient gradients, serene negative space',
+};
+
+async function runSynthesizeNarrativeTool(rawArgs: unknown, env: McpRuntimeEnv, nowMs = Date.now()) {
+  const parsed = SynthesizeNarrativeArgsSchema.safeParse(rawArgs);
+  if (!parsed.success) {
+    return toolResult({ error: 'Invalid arguments', details: parsed.error.flatten() }, true);
+  }
+
+  const data = parsed.data;
+  const db = drizzle(env.DB, { schema });
+  const [person] = await db
+    .select()
+    .from(schema.people)
+    .where(eq(schema.people.id, data.person_id))
+    .limit(1);
+
+  if (!person || isSyntheticTestPerson(person)) {
+    return toolResult({ status: 'not_found', error: 'Person not found', person_id: data.person_id }, true);
+  }
+
+  const [allEvents, allSignals] = await Promise.all([
+    db
+      .select()
+      .from(schema.timelineEvents)
+      .where(eq(schema.timelineEvents.personId, person.id))
+      .orderBy(asc(schema.timelineEvents.occurredAt)),
+    db
+      .select()
+      .from(schema.signals)
+      .where(eq(schema.signals.personId, person.id))
+      .orderBy(asc(schema.signals.validFrom)),
+  ]);
+
+  const targetMonth =
+    data.month ??
+    (allEvents.length > 0
+      ? allEvents[allEvents.length - 1].occurredAt.slice(0, 7)
+      : new Date(nowMs).toISOString().slice(0, 7));
+
+  const [yearStr, monthStr] = targetMonth.split('-');
+  const yearNum = Number(yearStr);
+  const monthIdx = Number(monthStr) - 1;
+  const monthStartMs = Date.UTC(yearNum, monthIdx, 1, 0, 0, 0);
+  const monthEndMs = Date.UTC(yearNum, monthIdx + 1, 1, 0, 0, 0);
+  const monthStartIso = new Date(monthStartMs).toISOString();
+  const monthEndIso = new Date(monthEndMs).toISOString();
+
+  const monthEvents = allEvents.filter((e) => {
+    const t = Date.parse(e.occurredAt);
+    return t >= monthStartMs && t < monthEndMs;
+  });
+
+  // Bitemporal signals valid at any point during [monthStartMs, monthEndMs)
+  const validSignalsInMonth = allSignals.filter((s) => {
+    const fromMs = Date.parse(s.validFrom);
+    const toMs = s.validTo === null ? Number.POSITIVE_INFINITY : Date.parse(s.validTo);
+    return fromMs < monthEndMs && toMs > monthStartMs;
+  });
+
+  const signalById = new Map(allSignals.map((s) => [s.id, s]));
+  const bitemporalShiftsInMonth = allSignals
+    .filter((s) => {
+      if (!s.validTo) return false;
+      const toMs = Date.parse(s.validTo);
+      return toMs >= monthStartMs && toMs < monthEndMs;
+    })
+    .map((s) => {
+      const replacement = s.supersededBy ? signalById.get(s.supersededBy) : undefined;
+      return {
+        topic: s.topic,
+        category: s.category,
+        old_value: s.value,
+        new_value: replacement?.value ?? null,
+        changed_at: s.validTo,
+      };
+    });
+
+  const scores = monthEvents
+    .map((e) => e.sentimentScore)
+    .filter((s): s is number => typeof s === 'number');
+  const avgSentiment =
+    scores.length > 0 ? roundScore(scores.reduce((a, b) => a + b, 0) / scores.length) : null;
+  const openingSentiment = scores.length > 0 ? scores[0] : null;
+  const closingSentiment = scores.length > 0 ? scores[scores.length - 1] : null;
+
+  let dominantMood: 'warm_nourishing' | 'evolving_turning_point' | 'calm_steady' | 'reflective_quiet' =
+    'reflective_quiet';
+  if (bitemporalShiftsInMonth.length > 0) {
+    dominantMood = 'evolving_turning_point';
+  } else if (avgSentiment !== null && avgSentiment >= 0.4) {
+    dominantMood = 'warm_nourishing';
+  } else if (monthEvents.length > 0) {
+    dominantMood = 'calm_steady';
+  }
+
+  const activePortrait = {
+    preferences: validSignalsInMonth
+      .filter((s) => s.category === 'preference')
+      .map((s) => ({ topic: s.topic, value: s.value, valid_to: s.validTo })),
+    gift_ideas: validSignalsInMonth
+      .filter((s) => s.category === 'gift_idea')
+      .map((s) => ({ topic: s.topic, value: s.value, valid_to: s.validTo })),
+    boundaries: validSignalsInMonth
+      .filter((s) => s.category === 'boundary')
+      .map((s) => ({ topic: s.topic, value: s.value, valid_to: s.validTo })),
+  };
+
+  const aestheticTag = STYLE_AESTHETIC_PROMPTS[data.style];
+  const isZh = data.language === 'zh';
+
+  const chapters =
+    monthEvents.length > 0
+      ? monthEvents.map((ev, idx) => {
+          const dateLabel = ev.occurredAt.slice(0, 10);
+          const moodWord =
+            (ev.sentimentScore ?? 0) >= 0.5
+              ? 'warm, joyful atmosphere'
+              : (ev.sentimentScore ?? 0) < 0
+                ? 'contemplative, moody lighting'
+                : 'calm everyday serenity';
+          const narrationScript = isZh
+            ? `第 ${idx + 1} 幕，${dateLabel}。在与 ${person.alias} 的这次相聚中：${ev.summary}`
+            : `Chapter ${idx + 1}, ${dateLabel}. During this moment with ${person.alias}: ${ev.summary}`;
+
+          return {
+            chapter_number: idx + 1,
+            occurred_at: ev.occurredAt,
+            source: ev.source,
+            headline: ev.summary,
+            sentiment_score: ev.sentimentScore,
+            flux_image_prompt: `Scene featuring character "${person.alias}": ${ev.summary}. ${moodWord}, ${aestheticTag}, no text or watermarks --ar 16:9`,
+            elevenlabs_tts: {
+              script: narrationScript,
+              emotion_cue:
+                (ev.sentimentScore ?? 0) >= 0.5
+                  ? 'warm_and_smiling'
+                  : (ev.sentimentScore ?? 0) < 0
+                    ? 'gentle_and_reflective'
+                    : 'calm_conversational',
+              voice_settings: {
+                stability: 0.62,
+                similarity_boost: 0.8,
+                style: (ev.sentimentScore ?? 0) >= 0.5 ? 0.45 : 0.25,
+                use_speaker_boost: true,
+              },
+            },
+          };
+        })
+      : [
+          {
+            chapter_number: 1,
+            occurred_at: monthStartIso,
+            source: 'monthly_reflection',
+            headline: isZh
+              ? `${targetMonth} 与 ${person.alias} 处于安静的留白期`
+              : `A quiet, unhurried month with ${person.alias} in ${targetMonth}`,
+            sentiment_score: null,
+            flux_image_prompt: `Serene window view with two tea cups waiting on a wooden table for "${person.alias}", ${aestheticTag}, soft morning light --ar 16:9`,
+            elevenlabs_tts: {
+              script: isZh
+                ? `${targetMonth}，与 ${person.alias} 的故事处于一段安静的留白期，等待下一次重逢。`
+                : `In ${targetMonth}, the story with ${person.alias} rested in a quiet pause, waiting for the next catch-up.`,
+              emotion_cue: 'gentle_and_reflective',
+              voice_settings: {
+                stability: 0.7,
+                similarity_boost: 0.8,
+                style: 0.2,
+                use_speaker_boost: true,
+              },
+            },
+          },
+        ];
+
+  const shiftSummaryZh =
+    bitemporalShiftsInMonth.length > 0
+      ? `本月捕捉到了 ${bitemporalShiftsInMonth.length} 处双时态偏好/状态的演进（${bitemporalShiftsInMonth
+          .map((s) => `${s.topic} 从「${s.old_value}」更新为「${s.new_value ?? '已归档'}」`)
+          .join('；')}）。`
+      : '本月对方的核心喜好与边界保持稳定。';
+
+  const shiftSummaryEn =
+    bitemporalShiftsInMonth.length > 0
+      ? `Captured ${bitemporalShiftsInMonth.length} bitemporal preference/boundary shift(s) this month (${bitemporalShiftsInMonth
+          .map((s) => `${s.topic}: "${s.old_value}" -> "${s.new_value ?? 'retired'}"`)
+          .join('; ')}).`
+      : 'Core preferences and boundaries remained steady throughout the month.';
+
+  const executiveSummary = isZh
+    ? `在 ${targetMonth}，你与 ${person.alias}（当前关系阶段：${person.relationshipState}）共留下了 ${monthEvents.length} 次互动记录，有效双时态画像维度共 ${validSignalsInMonth.length} 项。${shiftSummaryZh}`
+    : `During ${targetMonth}, you recorded ${monthEvents.length} interaction(s) with ${person.alias} (relationship stage: ${person.relationshipState}) alongside ${validSignalsInMonth.length} valid bitemporal signal(s). ${shiftSummaryEn}`;
+
+  const fullNarrationScript = [
+    isZh
+      ? `${targetMonth} · 与 ${person.alias} 的月度关系绘本。${executiveSummary}`
+      : `${targetMonth} · Monthly Relationship Storybook with ${person.alias}. ${executiveSummary}`,
+    ...chapters.map((c) => c.elevenlabs_tts.script),
+  ].join('\n\n');
+
+  return toolResult({
+    mode: 'monthly_narrative_recap',
+    person: {
+      id: person.id,
+      alias: person.alias,
+      relationship_state: person.relationshipState,
+    },
+    period: {
+      month: targetMonth,
+      start_at: monthStartIso,
+      end_at: monthEndIso,
+      event_count: monthEvents.length,
+      valid_signal_count: validSignalsInMonth.length,
+      transition_count: bitemporalShiftsInMonth.length,
+    },
+    emotional_arc: {
+      opening_sentiment: openingSentiment,
+      closing_sentiment: closingSentiment,
+      average_sentiment: avgSentiment,
+      dominant_mood: dominantMood,
+    },
+    narrative_recap: {
+      title: isZh
+        ? `${targetMonth} · 与 ${person.alias} 的关系手记`
+        : `${targetMonth} · Relationship Journal with ${person.alias}`,
+      executive_summary: executiveSummary,
+      active_portrait: activePortrait,
+      bitemporal_shifts: bitemporalShiftsInMonth,
+    },
+    chapters,
+    media_generation_pack: {
+      style: data.style,
+      language: data.language,
+      cover_flux_prompt: `Storybook cover illustration for "${person.alias}" (${targetMonth}), ${dominantMood.replace(/_/g, ' ')} mood, ${aestheticTag}, high detail --ar 3:4`,
+      full_elevenlabs_script: fullNarrationScript,
+    },
+  });
+}
+
 export async function handleMcpRequest(request: Request, env: McpRuntimeEnv): Promise<Response> {
   if (request.method !== 'POST') {
     return new Response(
@@ -1394,12 +2495,20 @@ export async function handleMcpRequest(request: Request, env: McpRuntimeEnv): Pr
       switch (toolName) {
         case 'create_person':
           return jsonRpcSuccess(id, await runCreatePersonTool(args, env));
+        case 'update_person':
+          return jsonRpcSuccess(id, await runUpdatePersonTool(args, env));
         case 'query_relationship_records':
           return jsonRpcSuccess(id, await runQueryTool(args, env));
         case 'insert_relationship_event':
           return jsonRpcSuccess(id, await runInsertTool(args, env));
+        case 'manage_signals':
+          return jsonRpcSuccess(id, await runManageSignalsTool(args, env));
+        case 'ingest_voice_memo':
+          return jsonRpcSuccess(id, await runIngestVoiceMemoTool(args, env));
         case 'analyze_relationship':
           return jsonRpcSuccess(id, await runAnalyzeTool(args, env));
+        case 'synthesize_narrative':
+          return jsonRpcSuccess(id, await runSynthesizeNarrativeTool(args, env));
         case 'manage_disambiguation_item':
           return jsonRpcSuccess(id, await runManageDisambiguationTool(args, env));
         default:

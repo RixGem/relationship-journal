@@ -86,9 +86,13 @@ describe('Bearer authentication guardrail & public routes', () => {
     expect(body.endpoint).toBe('/mcp');
     expect(body.tools.map((t) => t.name)).toEqual([
       'create_person',
+      'update_person',
       'query_relationship_records',
       'insert_relationship_event',
+      'manage_signals',
+      'ingest_voice_memo',
       'analyze_relationship',
+      'synthesize_narrative',
       'manage_disambiguation_item',
     ]);
   });

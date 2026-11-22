@@ -119,9 +119,13 @@ describe('MCP /mcp endpoint and query/insert/analyze tools', () => {
     };
     expect(listJson.result.tools.map((t) => t.name)).toEqual([
       'create_person',
+      'update_person',
       'query_relationship_records',
       'insert_relationship_event',
+      'manage_signals',
+      'ingest_voice_memo',
       'analyze_relationship',
+      'synthesize_narrative',
       'manage_disambiguation_item',
     ]);
     for (const tool of listJson.result.tools) {
@@ -745,5 +749,237 @@ describe('MCP /mcp endpoint and query/insert/analyze tools', () => {
       ((await listAllAfter.json()) as { result: { structuredContent: { count: number } } }).result
         .structuredContent.count
     ).toBe(2);
+  });
+
+  it('supports update_person, manage_signals, ingest_voice_memo (draft & commit), and synthesize_narrative (Flux & ElevenLabs)', async () => {
+    // 1. update_person: transition relationship_state from active -> discernment and merge key_dates
+    const updRes = await rpcCall({
+      jsonrpc: '2.0',
+      id: 70,
+      method: 'tools/call',
+      params: {
+        name: 'update_person',
+        arguments: {
+          person_id: ALEX_ID,
+          relationship_state: 'discernment',
+          key_dates: { tag: 'book_club', anniversary: '2026-12-01' },
+        },
+      },
+    });
+    const updJson = (await updRes.json()) as {
+      result: {
+        isError: boolean;
+        structuredContent: {
+          status: string;
+          previous: { relationship_state: string };
+          person: { relationship_state: string; key_dates: Record<string, unknown> };
+        };
+      };
+    };
+    expect(updJson.result.isError).toBe(false);
+    expect(updJson.result.structuredContent.status).toBe('updated');
+    expect(updJson.result.structuredContent.previous.relationship_state).toBe('active');
+    expect(updJson.result.structuredContent.person.relationship_state).toBe('discernment');
+    expect(updJson.result.structuredContent.person.key_dates).toMatchObject({
+      birthday: '2026-11-28',
+      met_at: '2026-09-15',
+      tag: 'book_club',
+      anniversary: '2026-12-01',
+    });
+
+    // 2. manage_signals: explicit override -> query as_of -> supersede with new_value -> retire
+    const sigOverride = await rpcCall({
+      jsonrpc: '2.0',
+      id: 71,
+      method: 'tools/call',
+      params: {
+        name: 'manage_signals',
+        arguments: {
+          action: 'override',
+          person_id: ALEX_ID,
+          category: 'boundary',
+          topic: 'late_night_text_boundary',
+          value: 'no_messages_after_11pm',
+          effective_at: '2026-11-01T10:00:00Z',
+        },
+      },
+    });
+    const sigOverrideJson = (await sigOverride.json()) as {
+      result: { isError: boolean; structuredContent: { status: string; signal: { id: string; value: string } } };
+    };
+    expect(sigOverrideJson.result.isError).toBe(false);
+    expect(sigOverrideJson.result.structuredContent.status).toBe('updated');
+
+    const sigSupersede = await rpcCall({
+      jsonrpc: '2.0',
+      id: 72,
+      method: 'tools/call',
+      params: {
+        name: 'manage_signals',
+        arguments: {
+          action: 'supersede',
+          person_id: ALEX_ID,
+          topic: 'late_night_text_boundary',
+          new_value: 'no_messages_after_10pm',
+          effective_at: '2026-11-15T10:00:00Z',
+        },
+      },
+    });
+    const sigSupersedeJson = (await sigSupersede.json()) as {
+      result: {
+        isError: boolean;
+        structuredContent: {
+          status: string;
+          bitemporal_update: { action: string; old_value: string; new_value: string };
+        };
+      };
+    };
+    expect(sigSupersedeJson.result.isError).toBe(false);
+    expect(sigSupersedeJson.result.structuredContent.bitemporal_update).toMatchObject({
+      action: 'superseded_conflicting_signal',
+      old_value: 'no_messages_after_11pm',
+      new_value: 'no_messages_after_10pm',
+    });
+
+    // Point-in-time query as_of 2026-11-10 returns old value 'no_messages_after_11pm'
+    const sigQueryAsOf = await rpcCall({
+      jsonrpc: '2.0',
+      id: 73,
+      method: 'tools/call',
+      params: {
+        name: 'manage_signals',
+        arguments: {
+          action: 'query',
+          person_id: ALEX_ID,
+          topic: 'late_night_text_boundary',
+          as_of: '2026-11-10T00:00:00Z',
+        },
+      },
+    });
+    const sigQueryAsOfJson = (await sigQueryAsOf.json()) as {
+      result: { structuredContent: { count: number; signals: Array<{ value: string }> } };
+    };
+    expect(sigQueryAsOfJson.result.structuredContent.count).toBe(1);
+    expect(sigQueryAsOfJson.result.structuredContent.signals[0].value).toBe('no_messages_after_11pm');
+
+    // 3. ingest_voice_memo: draft mode (commit: false) then commit mode (commit: true)
+    const memoDraft = await rpcCall({
+      jsonrpc: '2.0',
+      id: 74,
+      method: 'tools/call',
+      params: {
+        name: 'ingest_voice_memo',
+        arguments: {
+          raw_text:
+            '今天和 Alex Chen 喝下午茶，他的邮箱是 alex.chen@example.com，非常开心！他说自己对花生过敏，最近改喝冰燕麦拿铁，而且一直想要徕卡复古相机背带。',
+          source: 'voice_note',
+          occurred_at: '2026-11-18T14:00:00Z',
+          commit: false,
+        },
+      },
+    });
+    const memoDraftJson = (await memoDraft.json()) as {
+      result: {
+        isError: boolean;
+        structuredContent: {
+          mode: string;
+          committed: boolean;
+          attribution: { person_id: string; confidence: number; will_route_to_disambiguation: boolean };
+          pii_redaction: { redacted_entities: string[] };
+          extracted_signals: Array<{ category: string; topic: string; value: string }>;
+          draft_ingest_payloads: Array<Record<string, unknown>>;
+        };
+      };
+    };
+    expect(memoDraftJson.result.isError).toBe(false);
+    expect(memoDraftJson.result.structuredContent.mode).toBe('draft_preview');
+    expect(memoDraftJson.result.structuredContent.committed).toBe(false);
+    expect(memoDraftJson.result.structuredContent.attribution.person_id).toBe(ALEX_ID);
+    expect(memoDraftJson.result.structuredContent.attribution.confidence).toBeGreaterThanOrEqual(0.85);
+    expect(memoDraftJson.result.structuredContent.pii_redaction.redacted_entities).toEqual(['EMAIL']);
+    expect(memoDraftJson.result.structuredContent.extracted_signals.length).toBeGreaterThanOrEqual(3);
+
+    // Commit the voice memo
+    const memoCommit = await rpcCall({
+      jsonrpc: '2.0',
+      id: 75,
+      method: 'tools/call',
+      params: {
+        name: 'ingest_voice_memo',
+        arguments: {
+          raw_text:
+            '今天和 Alex Chen 喝下午茶，他的邮箱是 alex.chen@example.com，非常开心！他说自己对花生过敏，最近改喝冰燕麦拿铁，而且一直想要徕卡复古相机背带。',
+          source: 'voice_note',
+          occurred_at: '2026-11-18T14:00:00Z',
+          commit: true,
+        },
+      },
+    });
+    const memoCommitJson = (await memoCommit.json()) as {
+      result: {
+        isError: boolean;
+        structuredContent: {
+          mode: string;
+          committed: boolean;
+          ingest_outcomes: Array<{ status: string }>;
+        };
+      };
+    };
+    expect(memoCommitJson.result.isError).toBe(false);
+    expect(memoCommitJson.result.structuredContent.mode).toBe('committed');
+    expect(memoCommitJson.result.structuredContent.committed).toBe(true);
+    expect(
+      memoCommitJson.result.structuredContent.ingest_outcomes.every((o) => o.status === 'persisted')
+    ).toBe(true);
+
+    // 4. synthesize_narrative: generate monthly recap with Flux & ElevenLabs prompts for 2026-11
+    const synthRes = await rpcCall({
+      jsonrpc: '2.0',
+      id: 76,
+      method: 'tools/call',
+      params: {
+        name: 'synthesize_narrative',
+        arguments: {
+          person_id: ALEX_ID,
+          month: '2026-11',
+          style: 'storybook',
+          language: 'zh',
+        },
+      },
+    });
+    const synthJson = (await synthRes.json()) as {
+      result: {
+        isError: boolean;
+        structuredContent: {
+          mode: string;
+          period: { month: string; event_count: number; valid_signal_count: number; transition_count: number };
+          narrative_recap: {
+            title: string;
+            executive_summary: string;
+            bitemporal_shifts: Array<{ topic: string; old_value: string; new_value: string }>;
+          };
+          chapters: Array<{
+            chapter_number: number;
+            flux_image_prompt: string;
+            elevenlabs_tts: { script: string; voice_settings: { stability: number } };
+          }>;
+          media_generation_pack: { cover_flux_prompt: string; full_elevenlabs_script: string };
+        };
+      };
+    };
+    expect(synthJson.result.isError).toBe(false);
+    const recap = synthJson.result.structuredContent;
+    expect(recap.mode).toBe('monthly_narrative_recap');
+    expect(recap.period.month).toBe('2026-11');
+    expect(recap.period.event_count).toBeGreaterThanOrEqual(1);
+    expect(recap.period.transition_count).toBeGreaterThanOrEqual(1);
+    expect(recap.narrative_recap.bitemporal_shifts[0]).toMatchObject({
+      topic: 'late_night_text_boundary',
+      old_value: 'no_messages_after_11pm',
+      new_value: 'no_messages_after_10pm',
+    });
+    expect(recap.chapters[0].flux_image_prompt).toContain('--ar 16:9');
+    expect(recap.chapters[0].elevenlabs_tts.script).toContain('Alex Chen');
+    expect(recap.media_generation_pack.cover_flux_prompt).toContain('--ar 3:4');
   });
 });
