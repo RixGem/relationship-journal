@@ -26,13 +26,14 @@ Cloudflare Workers REST & MCP API backed by **Cloudflare D1 (SQLite)** and **Dri
 | `GET /people/:id/timeline` | Bearer | Lists persisted timeline events for a person ordered by `occurred_at DESC` |
 | `GET /people/:id/signals` | Bearer | Lists active signals (`valid_to IS NULL`), or full bitemporal history with `?include_history=true` |
 | `POST /mcp` | Bearer | MCP Streamable HTTP JSON-RPC 2.0 endpoint (`initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`) |
-| `GET /mcp/tools` | Bearer | Lists the 3 MCP tool schemas exposed by `POST /mcp` |
+| `GET /mcp/tools` | Bearer | Lists the 4 MCP tool schemas exposed by `POST /mcp` |
 
 ## MCP Tools (`POST /mcp`)
 
-1. **`query_relationship_records`** — Query people profiles, anonymized timeline events, and active or historical bitemporal signals from D1.
-2. **`insert_relationship_event`** — Run the full ingestion pipeline (PII redaction, SHA-256 idempotency, disambiguation routing, atomic D1 persistence).
-3. **`analyze_relationship`** — Compute interaction cadence, sentiment average and trend, active signals by category, bitemporal preference evolution (`preference_changes`), upcoming key dates, and follow-up hooks (or portfolio overview when `person_id` is omitted).
+1. **`create_person`** — Create a new person profile in D1 with alias, relationship state, and optional key dates.
+2. **`query_relationship_records`** — Query people profiles, anonymized timeline events, and active or historical bitemporal signals from D1.
+3. **`insert_relationship_event`** — Run the full ingestion pipeline (PII redaction, SHA-256 idempotency, disambiguation routing, atomic D1 persistence).
+4. **`analyze_relationship`** — Compute interaction cadence, sentiment average and trend, active signals by category, bitemporal preference evolution (`preference_changes`), upcoming key dates, and follow-up hooks (or portfolio overview when `person_id` is omitted).
 
 ```bash
 # Example: List MCP tools

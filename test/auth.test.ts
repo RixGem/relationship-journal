@@ -85,6 +85,7 @@ describe('Bearer authentication guardrail & public routes', () => {
     expect(body.protocol).toBe('mcp');
     expect(body.endpoint).toBe('/mcp');
     expect(body.tools.map((t) => t.name)).toEqual([
+      'create_person',
       'query_relationship_records',
       'insert_relationship_event',
       'analyze_relationship',

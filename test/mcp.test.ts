@@ -101,6 +101,7 @@ describe('MCP /mcp endpoint and query/insert/analyze tools', () => {
       result: { tools: Array<{ name: string; inputSchema: Record<string, unknown> }> };
     };
     expect(listJson.result.tools.map((t) => t.name)).toEqual([
+      'create_person',
       'query_relationship_records',
       'insert_relationship_event',
       'analyze_relationship',
@@ -373,5 +374,127 @@ describe('MCP /mcp endpoint and query/insert/analyze tools', () => {
       params: { name: 'nonexistent_tool', arguments: {} },
     });
     expect(((await unknownTool.json()) as { error: { code: number } }).error.code).toBe(-32602);
+  });
+
+  it('creates people via create_person, handles duplicate IDs and invalid aliases, and works with ingest/query/public demo isolation', async () => {
+    // 1. Create a person with server-generated UUID
+    const createRes = await rpcCall({
+      jsonrpc: '2.0',
+      id: 50,
+      method: 'tools/call',
+      params: {
+        name: 'create_person',
+        arguments: {
+          alias: 'Morgan Taylor',
+          relationship_state: 'close',
+          key_dates: { birthday: '2026-12-05', met_at: '2026-01-10' },
+        },
+      },
+    });
+    expect(createRes.status).toBe(200);
+    const createJson = (await createRes.json()) as {
+      result: {
+        isError: boolean;
+        structuredContent: {
+          status: string;
+          person: { id: string; alias: string; relationship_state: string; key_dates: Record<string, unknown> };
+        };
+      };
+    };
+    expect(createJson.result.isError).toBe(false);
+    expect(createJson.result.structuredContent.status).toBe('created');
+    const newPersonId = createJson.result.structuredContent.person.id;
+    expect(newPersonId).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(createJson.result.structuredContent.person.alias).toBe('Morgan Taylor');
+
+    // 2. Insert event for newly created person and query back
+    const insertRes = await rpcCall({
+      jsonrpc: '2.0',
+      id: 51,
+      method: 'tools/call',
+      params: {
+        name: 'insert_relationship_event',
+        arguments: {
+          person_id: newPersonId,
+          content: 'Prefers pour-over Ethiopian coffee.',
+          confidence: 0.95,
+          signal_topic: 'coffee_origin',
+          signal_value: 'ethiopia_pour_over',
+        },
+      },
+    });
+    const insertJson = (await insertRes.json()) as {
+      result: { isError: boolean; structuredContent: { status: string } };
+    };
+    expect(insertJson.result.isError).toBe(false);
+    expect(insertJson.result.structuredContent.status).toBe('persisted');
+
+    const queryRes = await rpcCall({
+      jsonrpc: '2.0',
+      id: 52,
+      method: 'tools/call',
+      params: {
+        name: 'query_relationship_records',
+        arguments: { person_id: newPersonId },
+      },
+    });
+    const queryJson = (await queryRes.json()) as {
+      result: {
+        structuredContent: {
+          counts: { timeline_events: number; signals: number };
+          signals: Array<{ value: string }>;
+        };
+      };
+    };
+    expect(queryJson.result.structuredContent.counts).toEqual({ timeline_events: 1, signals: 1 });
+    expect(queryJson.result.structuredContent.signals[0].value).toBe('ethiopia_pour_over');
+
+    // 3. Ensure non-[TEST_DATA] created person is excluded from public /db/demo
+    const demoRes = await SELF.fetch('https://example.com/db/demo');
+    const demoJson = (await demoRes.json()) as {
+      tables: { people: Array<{ id: string }> };
+    };
+    expect(demoJson.tables.people.some((p) => p.id === newPersonId)).toBe(false);
+
+    // 4. Explicit ID + duplicate conflict check
+    const explicitId = 'custom-person-001';
+    const firstExplicit = await rpcCall({
+      jsonrpc: '2.0',
+      id: 53,
+      method: 'tools/call',
+      params: {
+        name: 'create_person',
+        arguments: { id: explicitId, alias: 'Casey Lin' },
+      },
+    });
+    expect(((await firstExplicit.json()) as { result: { isError: boolean } }).result.isError).toBe(false);
+
+    const dupExplicit = await rpcCall({
+      jsonrpc: '2.0',
+      id: 54,
+      method: 'tools/call',
+      params: {
+        name: 'create_person',
+        arguments: { id: explicitId, alias: 'Casey Lin Duplicate' },
+      },
+    });
+    const dupJson = (await dupExplicit.json()) as {
+      result: { isError: boolean; structuredContent: { status: string; person_id: string } };
+    };
+    expect(dupJson.result.isError).toBe(true);
+    expect(dupJson.result.structuredContent.status).toBe('conflict');
+    expect(dupJson.result.structuredContent.person_id).toBe(explicitId);
+
+    // 5. Invalid empty alias rejected cleanly
+    const badAlias = await rpcCall({
+      jsonrpc: '2.0',
+      id: 55,
+      method: 'tools/call',
+      params: {
+        name: 'create_person',
+        arguments: { alias: '   ' },
+      },
+    });
+    expect(((await badAlias.json()) as { result: { isError: boolean } }).result.isError).toBe(true);
   });
 });

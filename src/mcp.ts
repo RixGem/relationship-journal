@@ -11,12 +11,53 @@ export interface McpRuntimeEnv {
 }
 
 export interface McpToolDefinition {
-  name: 'query_relationship_records' | 'insert_relationship_event' | 'analyze_relationship';
+  name:
+    | 'create_person'
+    | 'query_relationship_records'
+    | 'insert_relationship_event'
+    | 'analyze_relationship';
   description: string;
   inputSchema: Record<string, unknown>;
 }
 
 export const MCP_TOOLS: McpToolDefinition[] = [
+  {
+    name: 'create_person',
+    description:
+      'Create a new person profile in D1 so relationship events and bitemporal signals can be ingested and analyzed for them.',
+    inputSchema: {
+      type: 'object',
+      required: ['alias'],
+      properties: {
+        id: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 128,
+          description: 'Optional unique person ID. Defaults to a server-generated UUID.',
+        },
+        alias: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 200,
+          description: 'Display alias or pseudonym for the person (avoid sensitive PII).',
+        },
+        relationship_state: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 64,
+          default: 'active',
+          description: 'Relationship status label (e.g., active, close, reconnect_needed, archived).',
+        },
+        key_dates: {
+          type: 'object',
+          additionalProperties: { type: ['string', 'boolean', 'number'] },
+          description:
+            'Optional key dates and metadata (e.g., {"birthday":"1995-06-15","met_at":"2026-11-20"}).',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
   {
     name: 'query_relationship_records',
     description:
@@ -563,6 +604,72 @@ async function runAnalyzeTool(rawArgs: unknown, env: McpRuntimeEnv, nowMs = Date
   });
 }
 
+const CreatePersonArgsSchema = z.object({
+  id: z.string().trim().min(1).max(128).optional(),
+  alias: z.string().trim().min(1).max(200),
+  relationship_state: z.string().trim().min(1).max(64).default('active'),
+  key_dates: z.record(z.string(), z.union([z.string(), z.boolean(), z.number()])).default({}),
+});
+
+function isUniqueConstraintError(err: unknown): boolean {
+  const parts: string[] = [];
+  let current: unknown = err;
+  for (let i = 0; i < 4 && current; i++) {
+    if (current instanceof Error) {
+      parts.push(current.message);
+      current = (current as Error & { cause?: unknown }).cause;
+    } else {
+      parts.push(String(current));
+      break;
+    }
+  }
+  return /UNIQUE constraint failed|SQLITE_CONSTRAINT/i.test(parts.join(' '));
+}
+
+async function runCreatePersonTool(rawArgs: unknown, env: McpRuntimeEnv) {
+  const parsed = CreatePersonArgsSchema.safeParse(rawArgs);
+  if (!parsed.success) {
+    return toolResult({ error: 'Invalid arguments', details: parsed.error.flatten() }, true);
+  }
+
+  const db = drizzle(env.DB, { schema });
+  const id = parsed.data.id ?? crypto.randomUUID();
+  const createdAt = new Date().toISOString();
+
+  try {
+    await db.insert(schema.people).values({
+      id,
+      alias: parsed.data.alias,
+      relationshipState: parsed.data.relationship_state,
+      keyDates: parsed.data.key_dates,
+      createdAt,
+    });
+  } catch (err) {
+    if (isUniqueConstraintError(err)) {
+      return toolResult(
+        {
+          status: 'conflict',
+          error: 'Person with this id already exists',
+          person_id: id,
+        },
+        true
+      );
+    }
+    throw err;
+  }
+
+  return toolResult({
+    status: 'created',
+    person: {
+      id,
+      alias: parsed.data.alias,
+      relationship_state: parsed.data.relationship_state,
+      key_dates: parsed.data.key_dates,
+      created_at: createdAt,
+    },
+  });
+}
+
 export async function handleMcpRequest(request: Request, env: McpRuntimeEnv): Promise<Response> {
   if (request.method !== 'POST') {
     return new Response(
@@ -644,6 +751,8 @@ export async function handleMcpRequest(request: Request, env: McpRuntimeEnv): Pr
       const args = params.arguments ?? {};
 
       switch (toolName) {
+        case 'create_person':
+          return jsonRpcSuccess(id, await runCreatePersonTool(args, env));
         case 'query_relationship_records':
           return jsonRpcSuccess(id, await runQueryTool(args, env));
         case 'insert_relationship_event':
