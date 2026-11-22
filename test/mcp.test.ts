@@ -281,8 +281,38 @@ describe('MCP /mcp endpoint and query/insert/analyze tools', () => {
         isError: boolean;
         structuredContent: {
           mode: string;
-          cadence: { total_events: number; by_source: { voice_note: number; chat_log: number; manual: number } };
-          sentiment: { scored_events: number; average: number; trend: string };
+          health: {
+            freshness_score: number;
+            composite_health_score: number;
+            target_cadence_days: number;
+            overdue_ratio: number | null;
+            risk_level: string;
+          };
+          cadence: {
+            total_events: number;
+            mean_interval_days: number | null;
+            stddev_interval_days: number | null;
+            drift_z_score: number | null;
+            target_cadence_days: number;
+            cadence_anomaly: boolean;
+            by_source: { voice_note: number; chat_log: number; manual: number; other: number };
+          };
+          sentiment: {
+            scored_events: number;
+            average: number;
+            ema: number;
+            recent_average: number;
+            momentum_slope: number;
+            trend: string;
+            energy_state: string;
+          };
+          depth_and_volatility: {
+            signal_yield_rate: number;
+            profile_coverage_score: number;
+            missing_dimensions: string[];
+            volatility_90d: number;
+            churn_rate: number;
+          };
           signals: {
             active_count: number;
             superseded_count: number;
@@ -296,10 +326,21 @@ describe('MCP /mcp endpoint and query/insert/analyze tools', () => {
     const analysis = analyzeAlexJson.result.structuredContent;
     expect(analysis.mode).toBe('person_analysis');
     expect(analysis.cadence.total_events).toBe(3);
+    expect(analysis.cadence.mean_interval_days).toBeGreaterThan(20);
+    expect(analysis.cadence.target_cadence_days).toBe(30);
     expect(analysis.cadence.by_source).toEqual({ voice_note: 1, chat_log: 1, manual: 1, other: 0 });
     expect(analysis.sentiment.scored_events).toBe(3);
     expect(analysis.sentiment.average).toBe(0.85);
+    expect(analysis.sentiment.ema).toBe(0.875);
+    expect(analysis.sentiment.momentum_slope).toBe(0.025);
     expect(analysis.sentiment.trend).toBe('improving');
+    expect(analysis.sentiment.energy_state).toBe('nourishing');
+    expect(analysis.depth_and_volatility.signal_yield_rate).toBe(1);
+    expect(analysis.depth_and_volatility.profile_coverage_score).toBe(75);
+    expect(analysis.depth_and_volatility.missing_dimensions).toEqual(['boundary']);
+    expect(analysis.depth_and_volatility.churn_rate).toBe(0.333);
+    expect(analysis.health.freshness_score).toBeGreaterThan(0);
+    expect(analysis.health.composite_health_score).toBeGreaterThan(50);
     expect(analysis.signals.active_count).toBe(2);
     expect(analysis.signals.superseded_count).toBe(1);
     expect(analysis.signals.preference_changes).toHaveLength(1);
@@ -308,6 +349,7 @@ describe('MCP /mcp endpoint and query/insert/analyze tools', () => {
       new_value: 'no_caffeine_rooibos_only',
     });
     expect(analysis.follow_up_hooks.some((h) => h.includes('handmade_tea_bowl'))).toBe(true);
+    expect(analysis.follow_up_hooks.some((h) => h.includes('Profile depth gap'))).toBe(true);
 
     // 8. Analyze portfolio overview (omit person_id)
     const analyzeAll = await rpcCall({
@@ -327,6 +369,7 @@ describe('MCP /mcp endpoint and query/insert/analyze tools', () => {
             superseded_signals: number;
             pending_disambiguation: number;
           };
+          priority_attention_queue: Array<{ person_id: string; risk_level: string }>;
         };
       };
     };
@@ -338,6 +381,11 @@ describe('MCP /mcp endpoint and query/insert/analyze tools', () => {
       superseded_signals: 1,
       pending_disambiguation: 1,
     });
+    expect(
+      analyzeAllJson.result.structuredContent.priority_attention_queue.some(
+        (p) => p.person_id === JORDAN_ID && p.risk_level === 'at_risk'
+      )
+    ).toBe(true);
   });
 
   it('enforces PII_TOKEN_KEY requirement outside development and returns standard JSON-RPC errors', async () => {

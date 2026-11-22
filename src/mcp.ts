@@ -153,7 +153,7 @@ export const MCP_TOOLS: McpToolDefinition[] = [
   {
     name: 'analyze_relationship',
     description:
-      'Compute deterministic relationship analytics from D1: interaction cadence, sentiment average & trend, active signals by category, bitemporal preference evolution, key-date countdowns, and follow-up hooks. Omit person_id for a portfolio overview.',
+      'Compute deterministic relationship analytics and quantitative health metrics from D1: decay/freshness score, composite health score, cadence drift Z-score, sentiment EMA & momentum slope, social depth/profile coverage, bitemporal signal volatility, key-date countdowns, and actionable follow-up hooks. Omit person_id for a portfolio overview with a priority attention queue.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -220,15 +220,91 @@ function roundScore(value: number): number {
   return Math.round(value * 1000) / 1000;
 }
 
+function inferTargetCadenceDays(relationshipState: string): number {
+  const s = relationshipState.toLowerCase();
+  if (
+    s.includes('close') ||
+    s.includes('partner') ||
+    s.includes('family') ||
+    s.includes('vip') ||
+    s.includes('inner') ||
+    s.includes('reconnect')
+  ) {
+    return 14;
+  }
+  if (s.includes('casual') || s.includes('acquaintance') || s.includes('low')) {
+    return 60;
+  }
+  if (s.includes('archive') || s.includes('dormant') || s.includes('inactive')) {
+    return 180;
+  }
+  return 30;
+}
+
+function computeCadenceMetrics(
+  occurredAtList: string[],
+  daysSinceLastInteraction: number | null,
+  targetCadenceDays: number
+) {
+  const gapDays: number[] = [];
+  for (let i = 1; i < occurredAtList.length; i++) {
+    const prevMs = Date.parse(occurredAtList[i - 1]);
+    const currMs = Date.parse(occurredAtList[i]);
+    if (Number.isFinite(prevMs) && Number.isFinite(currMs) && currMs >= prevMs) {
+      gapDays.push((currMs - prevMs) / DAY_MS);
+    }
+  }
+
+  let meanIntervalDays: number | null = null;
+  let stddevIntervalDays: number | null = null;
+  let driftZScore: number | null = null;
+
+  if (gapDays.length > 0) {
+    const mean = gapDays.reduce((acc, n) => acc + n, 0) / gapDays.length;
+    meanIntervalDays = roundScore(mean);
+    const variance =
+      gapDays.reduce((acc, n) => acc + (n - mean) * (n - mean), 0) / gapDays.length;
+    const stddev = Math.sqrt(variance);
+    stddevIntervalDays = roundScore(stddev);
+
+    if (daysSinceLastInteraction !== null) {
+      const effectiveStddev = Math.max(stddev, 1);
+      driftZScore = roundScore((daysSinceLastInteraction - mean) / effectiveStddev);
+    }
+  }
+
+  const overdueRatio =
+    daysSinceLastInteraction !== null
+      ? roundScore(daysSinceLastInteraction / targetCadenceDays)
+      : null;
+
+  const cadenceAnomaly =
+    (driftZScore !== null && driftZScore > 2.0) ||
+    (overdueRatio !== null && overdueRatio > 1.5);
+
+  return {
+    mean_interval_days: meanIntervalDays,
+    stddev_interval_days: stddevIntervalDays,
+    drift_z_score: driftZScore,
+    target_cadence_days: targetCadenceDays,
+    overdue_ratio: overdueRatio,
+    cadence_anomaly: cadenceAnomaly,
+  };
+}
+
 function computeSentimentStats(scores: number[]) {
   if (scores.length === 0) {
     return {
       scored_events: 0,
       average: null as number | null,
+      ema: null as number | null,
+      recent_average: null as number | null,
+      momentum_slope: null as number | null,
       latest: null as number | null,
       min: null as number | null,
       max: null as number | null,
       trend: 'insufficient_data' as const,
+      energy_state: 'insufficient_data' as const,
     };
   }
 
@@ -237,6 +313,19 @@ function computeSentimentStats(scores: number[]) {
   const latest = scores[scores.length - 1];
   const min = Math.min(...scores);
   const max = Math.max(...scores);
+
+  const alpha = 0.5;
+  let emaRaw = scores[0];
+  for (let i = 1; i < scores.length; i++) {
+    emaRaw = alpha * scores[i] + (1 - alpha) * emaRaw;
+  }
+  const ema = roundScore(emaRaw);
+
+  const recentWindow = scores.slice(-Math.min(3, scores.length));
+  const recentAverage = roundScore(
+    recentWindow.reduce((acc, n) => acc + n, 0) / recentWindow.length
+  );
+  const momentumSlope = scores.length >= 2 ? roundScore(ema - average) : null;
 
   let trend: 'improving' | 'declining' | 'stable' | 'insufficient_data' = 'insufficient_data';
   if (scores.length >= 2) {
@@ -255,7 +344,121 @@ function computeSentimentStats(scores: number[]) {
     }
   }
 
-  return { scored_events: scores.length, average, latest, min, max, trend };
+  let energyState: 'nourishing' | 'neutral' | 'draining' | 'cooling_warning' = 'neutral';
+  if (momentumSlope !== null && momentumSlope <= -0.15) {
+    energyState = 'cooling_warning';
+  } else if (ema >= 0.3) {
+    energyState = 'nourishing';
+  } else if (ema <= -0.2) {
+    energyState = 'draining';
+  }
+
+  return {
+    scored_events: scores.length,
+    average,
+    ema,
+    recent_average: recentAverage,
+    momentum_slope: momentumSlope,
+    latest,
+    min,
+    max,
+    trend,
+    energy_state: energyState,
+  };
+}
+
+function computeProfileCoverage(
+  activeByCategory: {
+    preference: unknown[];
+    gift_idea: unknown[];
+    boundary: unknown[];
+  },
+  keyDates: Record<string, unknown>
+) {
+  const hasRealKeyDate = Object.entries(keyDates).some(
+    ([k, v]) => k !== 'is_test' && typeof v === 'string' && v.trim().length > 0
+  );
+  const dimensions: Array<{ name: 'preference' | 'gift_idea' | 'boundary' | 'key_dates'; present: boolean }> = [
+    { name: 'preference', present: activeByCategory.preference.length > 0 },
+    { name: 'gift_idea', present: activeByCategory.gift_idea.length > 0 },
+    { name: 'boundary', present: activeByCategory.boundary.length > 0 },
+    { name: 'key_dates', present: hasRealKeyDate },
+  ];
+
+  const coveredCount = dimensions.filter((d) => d.present).length;
+  const profileCoverageScore = roundScore((coveredCount / dimensions.length) * 100);
+  const missingDimensions = dimensions.filter((d) => !d.present).map((d) => d.name);
+
+  return {
+    profile_coverage_score: profileCoverageScore,
+    missing_dimensions: missingDimensions,
+  };
+}
+
+function computeHealthMetrics(params: {
+  eventCount: number;
+  daysSinceLastInteraction: number | null;
+  targetCadenceDays: number;
+  overdueRatio: number | null;
+  cadenceAnomaly: boolean;
+  sentimentEma: number | null;
+  momentumSlope: number | null;
+  profileCoverageScore: number;
+  relationshipState: string;
+}) {
+  const {
+    eventCount,
+    daysSinceLastInteraction,
+    targetCadenceDays,
+    overdueRatio,
+    cadenceAnomaly,
+    sentimentEma,
+    momentumSlope,
+    profileCoverageScore,
+    relationshipState,
+  } = params;
+
+  const freshnessScore =
+    eventCount > 0 && daysSinceLastInteraction !== null
+      ? roundScore(100 * Math.exp(-daysSinceLastInteraction / targetCadenceDays))
+      : 0;
+
+  // Map sentiment EMA [-1, 1] -> [0, 100], defaulting to 50 when unscored
+  const sentimentNorm = sentimentEma !== null ? ((sentimentEma + 1) / 2) * 100 : 50;
+
+  const compositeHealthScore =
+    eventCount > 0
+      ? roundScore(0.5 * freshnessScore + 0.25 * sentimentNorm + 0.25 * profileCoverageScore)
+      : roundScore(0.25 * profileCoverageScore);
+
+  const stateLower = relationshipState.toLowerCase();
+  let riskLevel: 'healthy' | 'attention_needed' | 'at_risk' | 'dormant' = 'healthy';
+  if (stateLower.includes('archive') || stateLower.includes('dormant')) {
+    riskLevel = 'dormant';
+  } else if (
+    eventCount === 0 ||
+    freshnessScore < 25 ||
+    (overdueRatio !== null && overdueRatio > 1.5) ||
+    stateLower.includes('reconnect')
+  ) {
+    riskLevel = 'at_risk';
+  } else if (
+    freshnessScore < 50 ||
+    (overdueRatio !== null && overdueRatio >= 1.0) ||
+    cadenceAnomaly ||
+    (momentumSlope !== null && momentumSlope <= -0.15) ||
+    (sentimentEma !== null && sentimentEma <= -0.2)
+  ) {
+    riskLevel = 'attention_needed';
+  }
+
+  return {
+    freshness_score: freshnessScore,
+    composite_health_score: compositeHealthScore,
+    target_cadence_days: targetCadenceDays,
+    overdue_ratio: overdueRatio,
+    risk_level: riskLevel,
+  };
 }
 
 function computeUpcomingKeyDates(
@@ -436,21 +639,71 @@ async function runAnalyzeTool(rawArgs: unknown, env: McpRuntimeEnv, nowMs = Date
       const scores = personEvents
         .map((e) => e.sentimentScore)
         .filter((s): s is number => typeof s === 'number');
-      const avgSentiment =
-        scores.length > 0 ? roundScore(scores.reduce((acc, n) => acc + n, 0) / scores.length) : null;
+      const sentimentStats = computeSentimentStats(scores);
       const lastInteractionAt =
         personEvents.length > 0 ? personEvents[personEvents.length - 1].occurredAt : null;
+      const daysSinceLastInteraction =
+        lastInteractionAt !== null
+          ? Math.max(0, Math.floor((nowMs - Date.parse(lastInteractionAt)) / DAY_MS))
+          : null;
+
+      const targetCadenceDays = inferTargetCadenceDays(person.relationshipState);
+      const cadenceMetrics = computeCadenceMetrics(
+        personEvents.map((e) => e.occurredAt),
+        daysSinceLastInteraction,
+        targetCadenceDays
+      );
+
+      const activeBuckets = {
+        preference: personActiveSignals.filter((s) => s.category === 'preference'),
+        gift_idea: personActiveSignals.filter((s) => s.category === 'gift_idea'),
+        boundary: personActiveSignals.filter((s) => s.category === 'boundary'),
+      };
+      const coverage = computeProfileCoverage(activeBuckets, person.keyDates ?? {});
+      const health = computeHealthMetrics({
+        eventCount: personEvents.length,
+        daysSinceLastInteraction,
+        targetCadenceDays,
+        overdueRatio: cadenceMetrics.overdue_ratio,
+        cadenceAnomaly: cadenceMetrics.cadence_anomaly,
+        sentimentEma: sentimentStats.ema,
+        momentumSlope: sentimentStats.momentum_slope,
+        profileCoverageScore: coverage.profile_coverage_score,
+        relationshipState: person.relationshipState,
+      });
 
       return {
         person_id: person.id,
         alias: person.alias,
         relationship_state: person.relationshipState,
         event_count: personEvents.length,
-        average_sentiment: avgSentiment,
+        average_sentiment: sentimentStats.average,
+        sentiment_ema: sentimentStats.ema,
+        energy_state: sentimentStats.energy_state,
         active_signal_count: personActiveSignals.length,
         last_interaction_at: lastInteractionAt,
+        days_since_last_interaction: daysSinceLastInteraction,
+        freshness_score: health.freshness_score,
+        composite_health_score: health.composite_health_score,
+        overdue_ratio: health.overdue_ratio,
+        cadence_anomaly: cadenceMetrics.cadence_anomaly,
+        profile_coverage_score: coverage.profile_coverage_score,
+        risk_level: health.risk_level,
       };
     });
+
+    const priorityAttentionQueue = summaries
+      .filter((s) => s.risk_level === 'at_risk' || s.risk_level === 'attention_needed')
+      .sort((a, b) => a.composite_health_score - b.composite_health_score)
+      .map((s) => ({
+        person_id: s.person_id,
+        alias: s.alias,
+        risk_level: s.risk_level,
+        composite_health_score: s.composite_health_score,
+        freshness_score: s.freshness_score,
+        days_since_last_interaction: s.days_since_last_interaction,
+        overdue_ratio: s.overdue_ratio,
+      }));
 
     return toolResult({
       mode: 'portfolio_overview',
@@ -461,6 +714,7 @@ async function runAnalyzeTool(rawArgs: unknown, env: McpRuntimeEnv, nowMs = Date
         superseded_signals: supersededSignalTotal,
         pending_disambiguation: Number(pendingQueueRow[0]?.count ?? 0),
       },
+      priority_attention_queue: priorityAttentionQueue,
       people_summary: summaries,
     });
   }
@@ -504,6 +758,13 @@ async function runAnalyzeTool(rawArgs: unknown, env: McpRuntimeEnv, nowMs = Date
       ? Math.max(0, Math.floor((nowMs - Date.parse(lastInteractionAt)) / DAY_MS))
       : null;
 
+  const targetCadenceDays = inferTargetCadenceDays(person.relationshipState);
+  const cadenceMetrics = computeCadenceMetrics(
+    events.map((e) => e.occurredAt),
+    daysSinceLastInteraction,
+    targetCadenceDays
+  );
+
   const scores = events
     .map((e) => e.sentimentScore)
     .filter((s): s is number => typeof s === 'number');
@@ -527,6 +788,9 @@ async function runAnalyzeTool(rawArgs: unknown, env: McpRuntimeEnv, nowMs = Date
 
   let activeCount = 0;
   let supersededCount = 0;
+  let volatility90d = 0;
+  const ninetyDaysAgoMs = nowMs - 90 * DAY_MS;
+
   for (const signal of allSignals) {
     if (signal.validTo === null) {
       activeCount += 1;
@@ -542,6 +806,13 @@ async function runAnalyzeTool(rawArgs: unknown, env: McpRuntimeEnv, nowMs = Date
       });
     } else {
       supersededCount += 1;
+      const changedAtStr = signal.validTo ?? signal.supersededAt;
+      if (changedAtStr) {
+        const changedMs = Date.parse(changedAtStr);
+        if (Number.isFinite(changedMs) && changedMs >= ninetyDaysAgoMs && changedMs <= nowMs) {
+          volatility90d += 1;
+        }
+      }
       if (signal.supersededBy) {
         const replacement = signalById.get(signal.supersededBy);
         preferenceChanges.push({
@@ -549,13 +820,30 @@ async function runAnalyzeTool(rawArgs: unknown, env: McpRuntimeEnv, nowMs = Date
           category: signal.category,
           old_value: signal.value,
           new_value: replacement?.value ?? null,
-          changed_at: signal.validTo ?? signal.supersededAt,
+          changed_at: changedAtStr,
           deprecated_signal_id: signal.id,
           new_signal_id: signal.supersededBy,
         });
       }
     }
   }
+
+  const totalSignals = activeCount + supersededCount;
+  const signalYieldRate =
+    events.length > 0 ? roundScore(totalSignals / events.length) : totalSignals > 0 ? totalSignals : 0;
+  const churnRate = totalSignals > 0 ? roundScore(supersededCount / totalSignals) : 0;
+  const coverage = computeProfileCoverage(activeByCategory, person.keyDates ?? {});
+  const health = computeHealthMetrics({
+    eventCount: events.length,
+    daysSinceLastInteraction,
+    targetCadenceDays,
+    overdueRatio: cadenceMetrics.overdue_ratio,
+    cadenceAnomaly: cadenceMetrics.cadence_anomaly,
+    sentimentEma: sentiment.ema,
+    momentumSlope: sentiment.momentum_slope,
+    profileCoverageScore: coverage.profile_coverage_score,
+    relationshipState: person.relationshipState,
+  });
 
   const upcomingKeyDates = computeUpcomingKeyDates(person.keyDates ?? {}, nowMs);
 
@@ -577,6 +865,21 @@ async function runAnalyzeTool(rawArgs: unknown, env: McpRuntimeEnv, nowMs = Date
   ) {
     followUpHooks.push('Schedule reconnect check-in');
   }
+  if (cadenceMetrics.cadence_anomaly && cadenceMetrics.drift_z_score !== null) {
+    followUpHooks.push(
+      `Cadence anomaly detected (Z=${cadenceMetrics.drift_z_score}): silence of ${daysSinceLastInteraction}d exceeds typical ${cadenceMetrics.mean_interval_days}d interval`
+    );
+  }
+  if (sentiment.energy_state === 'cooling_warning') {
+    followUpHooks.push(
+      `Sentiment cooling alert: EMA (${sentiment.ema}) dropped below historical average (${sentiment.average})`
+    );
+  }
+  if (events.length >= 3 && coverage.missing_dimensions.includes('boundary')) {
+    followUpHooks.push(
+      `Profile depth gap: ${events.length} interactions recorded but 0 boundary signals captured`
+    );
+  }
 
   return toolResult({
     mode: 'person_analysis',
@@ -585,14 +888,28 @@ async function runAnalyzeTool(rawArgs: unknown, env: McpRuntimeEnv, nowMs = Date
       alias: person.alias,
       relationship_state: person.relationshipState,
     },
+    health,
     cadence: {
       total_events: events.length,
       first_interaction_at: firstInteractionAt,
       last_interaction_at: lastInteractionAt,
       days_since_last_interaction: daysSinceLastInteraction,
+      mean_interval_days: cadenceMetrics.mean_interval_days,
+      stddev_interval_days: cadenceMetrics.stddev_interval_days,
+      drift_z_score: cadenceMetrics.drift_z_score,
+      target_cadence_days: cadenceMetrics.target_cadence_days,
+      overdue_ratio: cadenceMetrics.overdue_ratio,
+      cadence_anomaly: cadenceMetrics.cadence_anomaly,
       by_source: bySource,
     },
     sentiment,
+    depth_and_volatility: {
+      signal_yield_rate: signalYieldRate,
+      profile_coverage_score: coverage.profile_coverage_score,
+      missing_dimensions: coverage.missing_dimensions,
+      volatility_90d: volatility90d,
+      churn_rate: churnRate,
+    },
     signals: {
       active_count: activeCount,
       superseded_count: supersededCount,
