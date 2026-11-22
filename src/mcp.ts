@@ -20,11 +20,19 @@ export interface McpToolDefinition {
   inputSchema: Record<string, unknown>;
 }
 
+export const MCP_SERVER_INSTRUCTIONS = [
+  'Relationship Journal MCP — AI Usage Playbook:',
+  '1. ENTITY RESOLUTION FIRST: Before logging an event or creating a person, call `query_relationship_records` (with no `person_id`) to check existing contacts and resolve their `person_id`. Only call `create_person` for a genuinely new contact.',
+  '2. TURN LOGS INTO BITEMPORAL SIGNALS: Avoid logging bare timeline text when durable facts are present. Whenever a note reveals a preference, a gift clue, or a personal boundary/allergy/taboo, extract `signal_topic` (normalized snake_case like `beverage_preference`, `dietary_allergy`, `wrist_watch_wish`), `signal_value`, and `signal_category` (`preference` | `gift_idea` | `boundary`), plus `sentiment_score` (-1.0 to 1.0). Reusing the same `signal_topic` when a person changes their mind automatically closes the old bitemporal interval (`valid_to`) and links `superseded_by`.',
+  '3. ANTI-POISONING CONFIDENCE RULE: `confidence` (0.0-1.0) measures Entity Attribution / Coreference certainty (whether the note truly belongs to `person_id`). Use `>= 0.85` only when person attribution is unambiguous. When pronouns or nicknames are ambiguous, either ask the user to clarify or submit `< 0.85` (or `person_id: null`) so the note is safely isolated in `disambiguation_queue`.',
+  '4. QUANTITATIVE DECISION MAKING: Use `analyze_relationship` (omit `person_id`) to surface `priority_attention_queue` (who to reach out to right now based on exponential decay `freshness_score` and `overdue_ratio`). Before the user meets or buys a gift for someone, call `analyze_relationship` with `person_id` to inspect `cadence.drift_z_score` (unusual silence), `sentiment.energy_state` (`nourishing` vs `cooling_warning` vs `draining`), `signals.preference_changes` (avoid outdated habits), and `depth_and_volatility.missing_dimensions` (suggest conversation topics to fill missing `boundary` or `gift_idea` knowledge).',
+].join('\n');
+
 export const MCP_TOOLS: McpToolDefinition[] = [
   {
     name: 'create_person',
     description:
-      'Create a new person profile in D1 so relationship events and bitemporal signals can be ingested and analyzed for them.',
+      'Create a new person profile in D1. BEST PRACTICE: First call `query_relationship_records` (omitting `person_id`) to verify the person does not already exist. Choose `relationship_state` carefully because it drives the quantitative target contact cadence tau (`close`/`partner`/`family`/`vip`/`reconnect_needed` -> 14d half-life; `active` -> 30d; `casual`/`acquaintance` -> 60d; `archived`/`dormant` -> 180d). Populate `key_dates` (e.g. `birthday`, `anniversary` in YYYY-MM-DD) to enable automatic 90-day countdown alerts and raise profile coverage score.',
     inputSchema: {
       type: 'object',
       required: ['alias'],
@@ -33,26 +41,28 @@ export const MCP_TOOLS: McpToolDefinition[] = [
           type: 'string',
           minLength: 1,
           maxLength: 128,
-          description: 'Optional unique person ID. Defaults to a server-generated UUID.',
+          description: 'Optional unique person ID. Omit to auto-generate a UUID.',
         },
         alias: {
           type: 'string',
           minLength: 1,
           maxLength: 200,
-          description: 'Display alias or pseudonym for the person (avoid sensitive PII).',
+          description:
+            'Display alias or pseudonym for the person (prefer privacy-safe aliases over raw government IDs or full legal PII).',
         },
         relationship_state: {
           type: 'string',
           minLength: 1,
           maxLength: 64,
           default: 'active',
-          description: 'Relationship status label (e.g., active, close, reconnect_needed, archived).',
+          description:
+            'Relationship tier/status controlling decay half-life tau: use `close`, `partner`, `family`, `vip`, or `reconnect_needed` (14d target cadence); `active` (30d); `casual` or `acquaintance` (60d); `archived` or `dormant` (180d).',
         },
         key_dates: {
           type: 'object',
           additionalProperties: { type: ['string', 'boolean', 'number'] },
           description:
-            'Optional key dates and metadata (e.g., {"birthday":"1995-06-15","met_at":"2026-11-20"}).',
+            'Key dates in YYYY-MM-DD format (e.g., {"birthday":"1995-06-15","anniversary":"2023-09-10","met_at":"2022-04-01"}). Recurring keys `birthday` and `anniversary` trigger automatic upcoming countdown hooks.',
         },
       },
       additionalProperties: false,
@@ -61,30 +71,33 @@ export const MCP_TOOLS: McpToolDefinition[] = [
   {
     name: 'query_relationship_records',
     description:
-      'Query people profiles, anonymized timeline events, and bitemporal signals (active or full history) from D1. Omit person_id to list all people.',
+      'Query contact profiles, PII-sanitized timeline events, and bitemporal signals from D1. WORKFLOW: (1) Call with `{}` (no `person_id`) to list all people and resolve a contact name/alias to `person_id` before inserting or analyzing. (2) Call with `person_id` to retrieve raw interaction history and active signals (`include_history: false`) or full bitemporal evolution including superseded values (`include_history: true`).',
     inputSchema: {
       type: 'object',
       properties: {
         person_id: {
           type: 'string',
-          description: 'Target person ID. Omit to list all people profiles.',
+          description:
+            'Target person ID. Omit to list the full contact directory (`mode: "list_people"`).',
         },
         include_history: {
           type: 'boolean',
           default: false,
-          description: 'When true, include superseded and historical signals (valid_to IS NOT NULL).',
+          description:
+            'False (default) returns only currently valid signals (`valid_to IS NULL`). Set true to inspect historical/superseded preferences and when they changed.',
         },
         category: {
           type: 'string',
           enum: ['gift_idea', 'preference', 'boundary'],
-          description: 'Optional signal category filter when querying a specific person.',
+          description:
+            'Optional filter for signal category (`preference` for likes/habits, `gift_idea` for wishlists, `boundary` for allergies/taboos/triggers).',
         },
         limit: {
           type: 'integer',
           minimum: 1,
           maximum: 100,
           default: 20,
-          description: 'Maximum timeline events to return when querying a person.',
+          description: 'Maximum recent timeline events to return when querying a specific person (1-100).',
         },
       },
       additionalProperties: false,
@@ -93,58 +106,69 @@ export const MCP_TOOLS: McpToolDefinition[] = [
   {
     name: 'insert_relationship_event',
     description:
-      'Sanitize PII, enforce SHA-256 idempotency, route low-confidence or unassigned notes to disambiguation_queue, and atomically persist timeline events and bitemporal signals into D1.',
+      'Ingest a relationship interaction or note with automatic Layer-1 PII redaction, SHA-256 idempotency deduplication, coreference confidence gating, and bitemporal signal persistence. AI EXTRACTION GUIDE: Do not just dump raw text—always score `sentiment_score` (-1.0 to 1.0) and extract any durable fact into `signal_topic` + `signal_value` + `signal_category` (`preference`, `gift_idea`, or `boundary`). Use consistent snake_case for `signal_topic` (e.g., `beverage_preference`, `food_allergy`, `communication_style`) so that if a preference changes later, the engine automatically closes the prior bitemporal record (`valid_to`) and links `superseded_by`. If one note contains multiple distinct signals, call this tool once per signal.',
     inputSchema: {
       type: 'object',
       required: ['content', 'confidence'],
       properties: {
         person_id: {
           type: ['string', 'null'],
-          description: 'Known person ID, or null to route into disambiguation_queue.',
+          description:
+            'Resolved person ID from `query_relationship_records`. Pass `null` if you cannot determine which person the note refers to (routes safely to `disambiguation_queue`).',
         },
         source: {
           type: 'string',
           enum: ['voice_note', 'chat_log', 'manual'],
           default: 'manual',
+          description: 'Origin channel of the interaction (`voice_note`, `chat_log`, or `manual`).',
         },
         content: {
           type: 'string',
           minLength: 1,
           maxLength: 10000,
-          description: 'Raw note or interaction text (PII redacted before storage).',
+          description:
+            'Interaction summary or raw note text. Emails, phone numbers, SSNs, and credit cards are automatically redacted into stable HMAC tokens before D1 storage.',
         },
         confidence: {
           type: 'number',
           minimum: 0,
           maximum: 1,
-          description: 'Entity attribution confidence (< 0.85 routes to disambiguation_queue).',
+          description:
+            'Entity attribution / coreference confidence (0.0 to 1.0): how certain you are that this note belongs to `person_id`. Must be >= 0.85 to write to the person profile; < 0.85 quarantines the note in `disambiguation_queue` to prevent coreference poisoning.',
         },
         sentiment_score: {
           type: 'number',
           minimum: -1,
           maximum: 1,
+          description:
+            'Emotional valence of the interaction from -1.0 (draining/conflict/negative) through 0.0 (neutral) to +1.0 (warm/nourishing/positive). Powers `sentiment.ema`, `momentum_slope`, and `energy_state`.',
         },
         signal_topic: {
           type: 'string',
           minLength: 1,
           maxLength: 128,
-          description: 'Structured signal topic (must be paired with signal_value).',
+          description:
+            'Normalized snake_case topic key for a durable fact (e.g., `beverage_preference`, `dietary_restriction`, `book_wishlist`, `late_night_text_boundary`). Must be paired with `signal_value`. Reusing an existing topic for the same person with a new value triggers bitemporal superseding.',
         },
         signal_value: {
           type: 'string',
           minLength: 1,
           maxLength: 512,
-          description: 'Structured signal value (must be paired with signal_topic).',
+          description:
+            'Concrete value for `signal_topic` (e.g., `no_caffeine_rooibos_only`, `allergic_to_peanuts`, `first_edition_dune`). Must be paired with `signal_topic`.',
         },
         signal_category: {
           type: 'string',
           enum: ['gift_idea', 'preference', 'boundary'],
           default: 'preference',
+          description:
+            'Categorize the signal: `preference` (tastes, habits, favorites), `gift_idea` (explicit wishes or gift clues), or `boundary` (allergies, dealbreakers, sensitive topics, personal limits). Filling all 3 categories maximizes `profile_coverage_score`.',
         },
         occurred_at: {
           type: 'string',
           format: 'date-time',
-          description: 'ISO-8601 timestamp with timezone offset (defaults to server time).',
+          description:
+            'When the interaction actually happened in ISO-8601 format with timezone (e.g. `2026-11-22T18:30:00Z`). Supports historical backfills (automatically splits or closes bitemporal signal intervals). Defaults to current server time.',
         },
       },
       additionalProperties: false,
@@ -153,13 +177,14 @@ export const MCP_TOOLS: McpToolDefinition[] = [
   {
     name: 'analyze_relationship',
     description:
-      'Compute deterministic relationship analytics and quantitative health metrics from D1: decay/freshness score, composite health score, cadence drift Z-score, sentiment EMA & momentum slope, social depth/profile coverage, bitemporal signal volatility, key-date countdowns, and actionable follow-up hooks. Omit person_id for a portfolio overview with a priority attention queue.',
+      'Run quantitative relationship intelligence and diagnostic models. TWO MODES: (1) Omit `person_id` (`mode: "portfolio_overview"`) when the user asks "Who should I contact?", "How are my relationships doing?", or during weekly reviews—returns `priority_attention_queue` sorted by lowest `composite_health_score` to highlight contacts with high decay (`overdue_ratio`) or `at_risk` status. (2) Pass `person_id` (`mode: "person_analysis"`) before a meeting, catch-up, or gift decision—returns `health` (`freshness_score` 0-100, `composite_health_score` 0-100, `overdue_ratio`, `risk_level`), `cadence` (`mean_interval_days`, `drift_z_score`, `cadence_anomaly` when silence Z-score > 2.0), `sentiment` (`ema`, `momentum_slope`, `energy_state`: `nourishing` | `neutral` | `cooling_warning` | `draining`), `depth_and_volatility` (`signal_yield_rate`, `profile_coverage_score`, `missing_dimensions`, `volatility_90d`, `churn_rate`), `signals.preference_changes` (bitemporal old->new shifts), `upcoming_key_dates`, and actionable `follow_up_hooks`.',
     inputSchema: {
       type: 'object',
       properties: {
         person_id: {
           type: 'string',
-          description: 'Target person ID for detailed analysis. Omit for a global portfolio summary.',
+          description:
+            'Target person ID for deep quantitative diagnosis (`mode: "person_analysis"`). Omit for a global portfolio dashboard and `priority_attention_queue` (`mode: "portfolio_overview"`).',
         },
       },
       additionalProperties: false,
@@ -1049,8 +1074,9 @@ export async function handleMcpRequest(request: Request, env: McpRuntimeEnv): Pr
         },
         serverInfo: {
           name: 'relationship-journal-mcp',
-          version: '1.0.0',
+          version: '1.1.0',
         },
+        instructions: MCP_SERVER_INSTRUCTIONS,
       });
     }
 

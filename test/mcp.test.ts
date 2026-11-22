@@ -78,12 +78,18 @@ describe('MCP /mcp endpoint and query/insert/analyze tools', () => {
     const initJson = (await initRes.json()) as {
       jsonrpc: string;
       id: number;
-      result: { protocolVersion: string; serverInfo: { name: string }; capabilities: { tools: object } };
+      result: {
+        protocolVersion: string;
+        serverInfo: { name: string; version: string };
+        capabilities: { tools: object };
+        instructions: string;
+      };
     };
     expect(initJson.jsonrpc).toBe('2.0');
     expect(initJson.id).toBe(1);
     expect(initJson.result.protocolVersion).toBe('2025-03-26');
     expect(initJson.result.serverInfo.name).toBe('relationship-journal-mcp');
+    expect(initJson.result.instructions).toContain('AI Usage Playbook');
 
     const notifRes = await rpcCall({
       jsonrpc: '2.0',
