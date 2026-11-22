@@ -377,20 +377,12 @@ export async function handlePasskeyRoute(
         enrolled: false,
         registration_locked: false,
         rp_id: rpId,
-        message: 'No passkey enrolled yet. First registration will permanently lock enrollment to that passkey.',
       });
     }
     return jsonResponse({
       enrolled: true,
       registration_locked: true,
       rp_id: enrolled.rp_id,
-      credential: {
-        label: enrolled.label,
-        algorithm: enrolled.algorithm,
-        created_at: enrolled.created_at,
-        last_used_at: enrolled.last_used_at,
-      },
-      message: 'Passkey registration is permanently locked. Only the enrolled passkey can authenticate.',
     });
   }
 

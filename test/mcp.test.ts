@@ -4,6 +4,7 @@ import worker from '../src/index';
 
 const ALEX_ID = '00000000-0000-4000-8000-000000000101';
 const JORDAN_ID = '00000000-0000-4000-8000-000000000102';
+const SYNTH_DEMO_ID = '00000000-0000-4000-8000-000000000199';
 
 function mcpHeaders(extra: Record<string, string> = {}): Record<string, string> {
   return {
@@ -43,19 +44,29 @@ describe('MCP /mcp endpoint and query/insert/analyze tools', () => {
         'INSERT INTO people (id, alias, relationship_state, key_dates, created_at) VALUES (?, ?, ?, ?, ?)'
       ).bind(
         ALEX_ID,
-        '[TEST_DATA] Alex Chen',
-        'active_test',
-        JSON.stringify({ is_test: true, birthday: '2026-11-28', met_at: '2026-09-15' }),
+        'Alex Chen',
+        'active',
+        JSON.stringify({ birthday: '2026-11-28', met_at: '2026-09-15' }),
         '2026-10-01T18:00:00Z'
       ),
       env.DB.prepare(
         'INSERT INTO people (id, alias, relationship_state, key_dates, created_at) VALUES (?, ?, ?, ?, ?)'
       ).bind(
         JORDAN_ID,
-        '[TEST_DATA] Jordan Lee',
-        'reconnect_needed_test',
-        JSON.stringify({ is_test: true, anniversary: '2026-12-10' }),
+        'Jordan Lee',
+        'reconnect_needed',
+        JSON.stringify({ anniversary: '2026-12-10' }),
         '2026-10-12T14:30:00Z'
+      ),
+      // Synthetic [TEST_DATA] row that belongs ONLY to /db/demo and must be isolated from private MCP/App queries
+      env.DB.prepare(
+        'INSERT INTO people (id, alias, relationship_state, key_dates, created_at) VALUES (?, ?, ?, ?, ?)'
+      ).bind(
+        SYNTH_DEMO_ID,
+        '[TEST_DATA] Synthetic Demo Contact',
+        'active_test',
+        JSON.stringify({ is_test: true }),
+        '2026-10-01T00:00:00Z'
       ),
     ]);
   });

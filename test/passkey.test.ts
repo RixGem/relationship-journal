@@ -135,15 +135,15 @@ describe('Single-owner Passkey enrollment lock, WebAuthn verification, and front
     expect(regVerifyJson.registration_locked).toBe(true);
     expect(regVerifyJson.session_token).toMatch(/^rj_sess\./);
 
-    // 4. Status now reports enrolled & registration_locked
+    // 4. Status now reports enrolled & registration_locked without leaking credential label or timestamps
     const status1 = (await (await SELF.fetch('https://example.com/auth/passkey/status')).json()) as {
       enrolled: boolean;
       registration_locked: boolean;
-      credential: { label: string };
+      credential?: unknown;
     };
     expect(status1.enrolled).toBe(true);
     expect(status1.registration_locked).toBe(true);
-    expect(status1.credential.label).toBe('MacBook Pro Touch ID');
+    expect(status1.credential).toBeUndefined();
 
     // 5. Any new registration attempt is blocked with 403 Forbidden
     const secondOptRes = await SELF.fetch('https://example.com/auth/passkey/register/options', {

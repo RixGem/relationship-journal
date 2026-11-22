@@ -262,11 +262,23 @@ const QueryRecordsArgsSchema = z.object({
   include_history: z.boolean().default(false),
   category: z.enum(['gift_idea', 'preference', 'boundary']).optional(),
   limit: z.number().int().min(1).max(100).default(20),
+  include_test_data: z.boolean().default(false),
 });
 
 const AnalyzeRelationshipArgsSchema = z.object({
   person_id: z.string().min(1).optional(),
+  include_test_data: z.boolean().default(false),
 });
+
+function isSyntheticTestPerson(person: {
+  alias: string;
+  keyDates?: Record<string, unknown> | null;
+}): boolean {
+  return (
+    person.alias.startsWith('[TEST_DATA]') ||
+    Boolean(person.keyDates && person.keyDates.is_test === true)
+  );
+}
 
 const HISTORICAL_DATE_KEYS = new Set(['met_at', 'last_catchup', 'moved_city', 'created_at']);
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -603,10 +615,13 @@ async function runQueryTool(rawArgs: unknown, env: McpRuntimeEnv) {
   }
 
   const db = drizzle(env.DB, { schema });
-  const { person_id, include_history, category, limit } = parsed.data;
+  const { person_id, include_history, category, limit, include_test_data } = parsed.data;
 
   if (!person_id) {
-    const peopleRows = await db.select().from(schema.people).orderBy(asc(schema.people.id));
+    const allPeopleRows = await db.select().from(schema.people).orderBy(asc(schema.people.id));
+    const peopleRows = include_test_data
+      ? allPeopleRows
+      : allPeopleRows.filter((p) => !isSyntheticTestPerson(p));
     return toolResult({
       mode: 'list_people',
       count: peopleRows.length,
@@ -620,7 +635,7 @@ async function runQueryTool(rawArgs: unknown, env: McpRuntimeEnv) {
     .where(eq(schema.people.id, person_id))
     .limit(1);
 
-  if (!person) {
+  if (!person || (!include_test_data && isSyntheticTestPerson(person))) {
     return toolResult({ error: 'Person not found', person_id }, true);
   }
 
@@ -689,18 +704,32 @@ async function runAnalyzeTool(rawArgs: unknown, env: McpRuntimeEnv, nowMs = Date
   }
 
   const db = drizzle(env.DB, { schema });
-  const { person_id } = parsed.data;
+  const { person_id, include_test_data } = parsed.data;
 
   if (!person_id) {
-    const [allPeople, allEvents, allSignals, pendingQueueRow] = await Promise.all([
+    const [rawPeople, rawEvents, rawSignals, pendingQueueRows] = await Promise.all([
       db.select().from(schema.people).orderBy(asc(schema.people.id)),
       db.select().from(schema.timelineEvents).orderBy(asc(schema.timelineEvents.occurredAt)),
       db.select().from(schema.signals).orderBy(asc(schema.signals.validFrom)),
       db
-        .select({ count: sql<number>`count(*)` })
+        .select()
         .from(schema.disambiguationQueue)
         .where(eq(schema.disambiguationQueue.status, 'pending')),
     ]);
+
+    const allPeople = include_test_data
+      ? rawPeople
+      : rawPeople.filter((p) => !isSyntheticTestPerson(p));
+    const allowedPersonIds = new Set(allPeople.map((p) => p.id));
+    const allEvents = include_test_data
+      ? rawEvents
+      : rawEvents.filter((e) => allowedPersonIds.has(e.personId));
+    const allSignals = include_test_data
+      ? rawSignals
+      : rawSignals.filter((s) => allowedPersonIds.has(s.personId));
+    const filteredPendingQueue = include_test_data
+      ? pendingQueueRows
+      : pendingQueueRows.filter((q) => !q.sanitizedContent.startsWith('[TEST_DATA]'));
 
     const eventsByPerson = new Map<string, typeof allEvents>();
     for (const event of allEvents) {
@@ -802,7 +831,7 @@ async function runAnalyzeTool(rawArgs: unknown, env: McpRuntimeEnv, nowMs = Date
         timeline_events: allEvents.length,
         active_signals: activeSignalTotal,
         superseded_signals: supersededSignalTotal,
-        pending_disambiguation: Number(pendingQueueRow[0]?.count ?? 0),
+        pending_disambiguation: filteredPendingQueue.length,
       },
       priority_attention_queue: priorityAttentionQueue,
       people_summary: summaries,
@@ -815,7 +844,7 @@ async function runAnalyzeTool(rawArgs: unknown, env: McpRuntimeEnv, nowMs = Date
     .where(eq(schema.people.id, person_id))
     .limit(1);
 
-  if (!person) {
+  if (!person || (!include_test_data && isSyntheticTestPerson(person))) {
     return toolResult({ error: 'Person not found', person_id }, true);
   }
 
@@ -1113,7 +1142,8 @@ async function runManageDisambiguationTool(rawArgs: unknown, env: McpRuntimeEnv)
             .orderBy(desc(schema.disambiguationQueue.createdAt))
             .limit(data.limit);
 
-    const rows = await query;
+    const rawRows = await query;
+    const rows = rawRows.filter((r) => !r.sanitizedContent.startsWith('[TEST_DATA]'));
     return toolResult({
       mode: 'list_disambiguation_queue',
       status_filter: data.status,
