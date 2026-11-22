@@ -2,6 +2,7 @@ import { and, desc, eq, isNull } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/d1';
 import { requireBearerAuth } from './auth';
 import { MCP_TOOLS, handleMcpRequest } from './mcp';
+import { handlePasskeyRoute } from './passkey';
 import {
   D1IngestStore,
   IngestPayloadSchema,
@@ -10,6 +11,7 @@ import {
   ingestEvent,
 } from './pipeline';
 import * as schema from './schema';
+import { renderFrontendHtml } from './ui';
 
 export type RuntimeEnv = Omit<Env, 'API_KEY' | 'ENVIRONMENT' | 'PII_TOKEN_KEY'> & {
   API_KEY?: string;
@@ -41,11 +43,37 @@ export default {
       const url = new URL(request.url);
 
       // Public minimal health endpoint
-      if ((url.pathname === '/health' || url.pathname === '/') && request.method === 'GET') {
+      if (url.pathname === '/health' && request.method === 'GET') {
         return jsonResponse({
           status: 'ok',
           service: 'relationship-journal-api',
         });
+      }
+
+      // Frontend SPA at GET / and GET /app (returns JSON on GET / only if Accept explicitly asks for application/json without text/html)
+      if ((url.pathname === '/' || url.pathname === '/app') && request.method === 'GET') {
+        const accept = request.headers.get('Accept') ?? '';
+        if (url.pathname === '/' && accept.includes('application/json') && !accept.includes('text/html')) {
+          return jsonResponse({
+            status: 'ok',
+            service: 'relationship-journal-api',
+          });
+        }
+        return new Response(renderFrontendHtml(), {
+          status: 200,
+          headers: {
+            'Content-Type': 'text/html; charset=utf-8',
+            'Cache-Control': 'no-store',
+          },
+        });
+      }
+
+      // Public Passkey (WebAuthn) enrollment & single-owner authentication routes
+      if (url.pathname.startsWith('/auth/passkey/')) {
+        const passkeyResponse = await handlePasskeyRoute(request, env);
+        if (passkeyResponse) {
+          return passkeyResponse;
+        }
       }
 
       // Public synthetic demo dataset viewer (strictly scoped to [TEST_DATA] rows only)

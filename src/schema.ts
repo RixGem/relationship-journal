@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import { index, real, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
+import { index, integer, real, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
 
 export const people = sqliteTable('people', {
   id: text('id').primaryKey(),
@@ -72,5 +72,26 @@ export const disambiguationQueue = sqliteTable('disambiguation_queue', {
   signalCategory: text('signal_category'),
   occurredAt: text('occurred_at').notNull(),
   status: text('status').notNull().default('pending'),
+  createdAt: text('created_at').notNull(),
+});
+
+export const passkeyCredentials = sqliteTable('passkey_credentials', {
+  slot: integer('slot').primaryKey().default(1),
+  credentialId: text('credential_id').notNull().unique(),
+  publicKeySpki: text('public_key_spki').notNull(),
+  algorithm: integer('algorithm').notNull().default(-7),
+  signCount: integer('sign_count').notNull().default(0),
+  label: text('label').notNull().default('Owner Passkey'),
+  rpId: text('rp_id').notNull(),
+  createdAt: text('created_at').notNull(),
+  lastUsedAt: text('last_used_at'),
+});
+
+export const passkeyChallenges = sqliteTable('passkey_challenges', {
+  challenge: text('challenge').primaryKey(),
+  purpose: text('purpose').notNull(),
+  rpId: text('rp_id').notNull(),
+  origin: text('origin').notNull(),
+  expiresAt: text('expires_at').notNull(),
   createdAt: text('created_at').notNull(),
 });
