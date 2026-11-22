@@ -111,6 +111,7 @@ describe('MCP /mcp endpoint and query/insert/analyze tools', () => {
       'query_relationship_records',
       'insert_relationship_event',
       'analyze_relationship',
+      'manage_disambiguation_item',
     ]);
     for (const tool of listJson.result.tools) {
       expect(tool.inputSchema.type).toBe('object');
@@ -550,5 +551,188 @@ describe('MCP /mcp endpoint and query/insert/analyze tools', () => {
       },
     });
     expect(((await badAlias.json()) as { result: { isError: boolean } }).result.isError).toBe(true);
+  });
+
+  it('lists, links/resolves, and dismisses items in disambiguation_queue via manage_disambiguation_item', async () => {
+    // 1. Insert two ambiguous notes into disambiguation_queue:
+    //    - Item A: missing person_id, has signal_topic/signal_value
+    //    - Item B: has person_id=JORDAN_ID but low confidence (0.50)
+    const ambA = await rpcCall({
+      jsonrpc: '2.0',
+      id: 60,
+      method: 'tools/call',
+      params: {
+        name: 'insert_relationship_event',
+        arguments: {
+          person_id: null,
+          source: 'voice_note',
+          content: 'They mentioned being severely allergic to shellfish.',
+          confidence: 0.45,
+          signal_topic: 'dietary_allergy',
+          signal_value: 'allergic_to_shellfish',
+          signal_category: 'boundary',
+          occurred_at: '2026-11-19T10:00:00Z',
+        },
+      },
+    });
+    const ambAJson = (await ambA.json()) as {
+      result: { structuredContent: { status: string; queue_id: string } };
+    };
+    expect(ambAJson.result.structuredContent.status).toBe('routed_to_disambiguation_queue');
+    const queueIdA = ambAJson.result.structuredContent.queue_id;
+
+    const ambB = await rpcCall({
+      jsonrpc: '2.0',
+      id: 61,
+      method: 'tools/call',
+      params: {
+        name: 'insert_relationship_event',
+        arguments: {
+          person_id: JORDAN_ID,
+          source: 'chat_log',
+          content: 'Maybe Jordan or someone else talking about weekend plans.',
+          confidence: 0.5,
+          occurred_at: '2026-11-20T15:00:00Z',
+        },
+      },
+    });
+    const ambBJson = (await ambB.json()) as {
+      result: { structuredContent: { status: string; queue_id: string } };
+    };
+    expect(ambBJson.result.structuredContent.status).toBe('routed_to_disambiguation_queue');
+    const queueIdB = ambBJson.result.structuredContent.queue_id;
+
+    // 2. List pending items
+    const listRes = await rpcCall({
+      jsonrpc: '2.0',
+      id: 62,
+      method: 'tools/call',
+      params: {
+        name: 'manage_disambiguation_item',
+        arguments: { action: 'list', status: 'pending' },
+      },
+    });
+    const listJson = (await listRes.json()) as {
+      result: {
+        isError: boolean;
+        structuredContent: { mode: string; count: number; items: Array<{ id: string; status: string }> };
+      };
+    };
+    expect(listJson.result.isError).toBe(false);
+    expect(listJson.result.structuredContent.mode).toBe('list_disambiguation_queue');
+    expect(listJson.result.structuredContent.count).toBe(2);
+
+    // 3. Link/resolve Item A to ALEX_ID with a sentiment_score
+    const linkRes = await rpcCall({
+      jsonrpc: '2.0',
+      id: 63,
+      method: 'tools/call',
+      params: {
+        name: 'manage_disambiguation_item',
+        arguments: {
+          action: 'link',
+          queue_id: queueIdA,
+          person_id: ALEX_ID,
+          sentiment_score: 0.4,
+        },
+      },
+    });
+    const linkJson = (await linkRes.json()) as {
+      result: {
+        isError: boolean;
+        structuredContent: {
+          status: string;
+          action: string;
+          queue_id: string;
+          person: { id: string };
+          ingest_outcome: { status: string; bitemporal_update: { action: string; value: string } };
+        };
+      };
+    };
+    expect(linkJson.result.isError).toBe(false);
+    expect(linkJson.result.structuredContent.status).toBe('resolved');
+    expect(linkJson.result.structuredContent.person.id).toBe(ALEX_ID);
+    expect(linkJson.result.structuredContent.ingest_outcome.status).toBe('persisted');
+    expect(linkJson.result.structuredContent.ingest_outcome.bitemporal_update.value).toBe(
+      'allergic_to_shellfish'
+    );
+
+    // Verify Alex now has the resolved boundary signal
+    const alexQuery = await rpcCall({
+      jsonrpc: '2.0',
+      id: 64,
+      method: 'tools/call',
+      params: {
+        name: 'query_relationship_records',
+        arguments: { person_id: ALEX_ID, category: 'boundary' },
+      },
+    });
+    const alexQueryJson = (await alexQuery.json()) as {
+      result: { structuredContent: { counts: { signals: number }; signals: Array<{ value: string }> } };
+    };
+    expect(alexQueryJson.result.structuredContent.counts.signals).toBe(1);
+    expect(alexQueryJson.result.structuredContent.signals[0].value).toBe('allergic_to_shellfish');
+
+    // 4. Re-resolving an already resolved item returns an error
+    const dupResolve = await rpcCall({
+      jsonrpc: '2.0',
+      id: 65,
+      method: 'tools/call',
+      params: {
+        name: 'manage_disambiguation_item',
+        arguments: { action: 'resolve', queue_id: queueIdA, person_id: ALEX_ID },
+      },
+    });
+    const dupResolveJson = (await dupResolve.json()) as {
+      result: { isError: boolean; structuredContent: { status: string } };
+    };
+    expect(dupResolveJson.result.isError).toBe(true);
+    expect(dupResolveJson.result.structuredContent.status).toBe('already_processed');
+
+    // 5. Dismiss Item B
+    const dismissRes = await rpcCall({
+      jsonrpc: '2.0',
+      id: 66,
+      method: 'tools/call',
+      params: {
+        name: 'manage_disambiguation_item',
+        arguments: { action: 'dismiss', queue_id: queueIdB },
+      },
+    });
+    const dismissJson = (await dismissRes.json()) as {
+      result: { isError: boolean; structuredContent: { status: string; queue_id: string } };
+    };
+    expect(dismissJson.result.isError).toBe(false);
+    expect(dismissJson.result.structuredContent.status).toBe('dismissed');
+    expect(dismissJson.result.structuredContent.queue_id).toBe(queueIdB);
+
+    // 6. Pending queue is now empty, while status='all' shows 2 processed items
+    const listPendingAfter = await rpcCall({
+      jsonrpc: '2.0',
+      id: 67,
+      method: 'tools/call',
+      params: {
+        name: 'manage_disambiguation_item',
+        arguments: { action: 'list', status: 'pending' },
+      },
+    });
+    expect(
+      ((await listPendingAfter.json()) as { result: { structuredContent: { count: number } } }).result
+        .structuredContent.count
+    ).toBe(0);
+
+    const listAllAfter = await rpcCall({
+      jsonrpc: '2.0',
+      id: 68,
+      method: 'tools/call',
+      params: {
+        name: 'manage_disambiguation_item',
+        arguments: { action: 'list', status: 'all' },
+      },
+    });
+    expect(
+      ((await listAllAfter.json()) as { result: { structuredContent: { count: number } } }).result
+        .structuredContent.count
+    ).toBe(2);
   });
 });

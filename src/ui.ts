@@ -316,6 +316,11 @@ export function renderFrontendHtml(): string {
           <h2><span>👥 联系人目录</span></h2>
           <div id="peopleList" class="muted">加载中...</div>
         </div>
+
+        <div class="card">
+          <h2><span>🧩 待消歧隔离队列 (manage_disambiguation_item)</span></h2>
+          <div id="disambiguationList" class="muted">加载中...</div>
+        </div>
       </div>
 
       <!-- Center Column: Quantitative Person Inspector -->
@@ -628,7 +633,10 @@ export function renderFrontendHtml(): string {
     }
 
     async function loadPortfolio() {
-      const overview = await mcpToolCall('analyze_relationship', {});
+      const [overview, disambig] = await Promise.all([
+        mcpToolCall('analyze_relationship', {}),
+        mcpToolCall('manage_disambiguation_item', { action: 'list', status: 'pending' })
+      ]);
       const t = overview.totals;
       document.getElementById('portfolioTotals').innerHTML = [
         { k: '联系人总数 (People)', v: t.people },
@@ -654,8 +662,66 @@ export function renderFrontendHtml(): string {
       const people = overview.people_summary || [];
       const plEl = document.getElementById('peopleList');
       const selectEl = document.getElementById('iePersonId');
-      selectEl.innerHTML = '<option value="">-- 指代不明 (进入消歧队列) --</option>' +
-        people.map((p) => '<option value="' + escapeHtml(p.person_id) + '">' + escapeHtml(p.alias) + ' (' + escapeHtml(p.relationship_state) + ')</option>').join('');
+      const peopleOptionsHtml = people.map((p) => '<option value="' + escapeHtml(p.person_id) + '">' + escapeHtml(p.alias) + ' (' + escapeHtml(p.relationship_state) + ')</option>').join('');
+      selectEl.innerHTML = '<option value="">-- 指代不明 (进入消歧队列) --</option>' + peopleOptionsHtml;
+
+      const dqEl = document.getElementById('disambiguationList');
+      const dqItems = (disambig && disambig.items) || [];
+      if (dqItems.length === 0) {
+        dqEl.innerHTML = '<div class="muted">✅ 队列为空，无待消歧记录。</div>';
+      } else {
+        dqEl.innerHTML = dqItems.map((item) => (
+          '<div style="padding:10px; border:1px solid var(--border); border-radius:8px; background:var(--panel-alt); margin-bottom:8px;">' +
+            '<div style="font-size:13px; margin-bottom:6px;"><b>[' + escapeHtml(item.source) + ']</b> ' + escapeHtml(item.sanitizedContent) + '</div>' +
+            '<div class="muted" style="margin-bottom:8px;">置信度: ' + item.confidence + (item.signalTopic ? ' · 信号: ' + escapeHtml(item.signalTopic) + '=' + escapeHtml(item.signalValue) : '') + '</div>' +
+            '<select class="dq-person-select" data-qid="' + escapeHtml(item.id) + '" style="margin-bottom:6px;">' +
+              '<option value="">-- 选择归属联系人 --</option>' + peopleOptionsHtml +
+            '</select>' +
+            '<div class="row-2">' +
+              '<button type="button" class="btn-primary dq-resolve-btn" data-qid="' + escapeHtml(item.id) + '" style="padding:6px 10px; font-size:12px;">🔗 绑定入库 (Link)</button>' +
+              '<button type="button" class="btn-secondary dq-dismiss-btn" data-qid="' + escapeHtml(item.id) + '" style="padding:6px 10px; font-size:12px;">🗑️ 忽略 (Dismiss)</button>' +
+            '</div>' +
+          '</div>'
+        )).join('');
+
+        dqEl.querySelectorAll('.dq-resolve-btn').forEach((btn) => {
+          btn.addEventListener('click', async () => {
+            const qid = btn.getAttribute('data-qid');
+            const sel = dqEl.querySelector('.dq-person-select[data-qid="' + qid + '"]');
+            const pid = sel ? sel.value : '';
+            if (!pid) {
+              alert('请先选择要绑定的目标联系人');
+              return;
+            }
+            try {
+              await mcpToolCall('manage_disambiguation_item', {
+                action: 'link',
+                queue_id: qid,
+                person_id: pid
+              });
+              selectedPersonId = pid;
+              await loadPortfolio();
+            } catch (err) {
+              alert(err.message);
+            }
+          });
+        });
+
+        dqEl.querySelectorAll('.dq-dismiss-btn').forEach((btn) => {
+          btn.addEventListener('click', async () => {
+            const qid = btn.getAttribute('data-qid');
+            try {
+              await mcpToolCall('manage_disambiguation_item', {
+                action: 'dismiss',
+                queue_id: qid
+              });
+              await loadPortfolio();
+            } catch (err) {
+              alert(err.message);
+            }
+          });
+        });
+      }
 
       if (people.length === 0) {
         plEl.innerHTML = '<div class="muted">暂无联系人，请在右侧创建。</div>';

@@ -89,6 +89,7 @@ describe('Bearer authentication guardrail & public routes', () => {
       'query_relationship_records',
       'insert_relationship_event',
       'analyze_relationship',
+      'manage_disambiguation_item',
     ]);
   });
 });

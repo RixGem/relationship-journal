@@ -15,7 +15,8 @@ export interface McpToolDefinition {
     | 'create_person'
     | 'query_relationship_records'
     | 'insert_relationship_event'
-    | 'analyze_relationship';
+    | 'analyze_relationship'
+    | 'manage_disambiguation_item';
   description: string;
   inputSchema: Record<string, unknown>;
 }
@@ -24,7 +25,7 @@ export const MCP_SERVER_INSTRUCTIONS = [
   'Relationship Journal MCP — AI Usage Playbook:',
   '1. ENTITY RESOLUTION FIRST: Before logging an event or creating a person, call `query_relationship_records` (with no `person_id`) to check existing contacts and resolve their `person_id`. Only call `create_person` for a genuinely new contact.',
   '2. TURN LOGS INTO BITEMPORAL SIGNALS: Avoid logging bare timeline text when durable facts are present. Whenever a note reveals a preference, a gift clue, or a personal boundary/allergy/taboo, extract `signal_topic` (normalized snake_case like `beverage_preference`, `dietary_allergy`, `wrist_watch_wish`), `signal_value`, and `signal_category` (`preference` | `gift_idea` | `boundary`), plus `sentiment_score` (-1.0 to 1.0). Reusing the same `signal_topic` when a person changes their mind automatically closes the old bitemporal interval (`valid_to`) and links `superseded_by`.',
-  '3. ANTI-POISONING CONFIDENCE RULE: `confidence` (0.0-1.0) measures Entity Attribution / Coreference certainty (whether the note truly belongs to `person_id`). Use `>= 0.85` only when person attribution is unambiguous. When pronouns or nicknames are ambiguous, either ask the user to clarify or submit `< 0.85` (or `person_id: null`) so the note is safely isolated in `disambiguation_queue`.',
+  '3. ANTI-POISONING CONFIDENCE & DISAMBIGUATION WORKFLOW: `confidence` (0.0-1.0) measures Entity Attribution / Coreference certainty (whether the note truly belongs to `person_id`). Use `>= 0.85` only when person attribution is unambiguous. When pronouns or nicknames are ambiguous, submit `< 0.85` (or `person_id: null`) so the note is safely isolated in `disambiguation_queue`. Later, use `manage_disambiguation_item` with `action: "list"` to review pending ambiguous notes with the user, `action: "resolve"` (or `"link"`) to attribute an item to a confirmed `person_id` and persist its timeline event/bitemporal signal, or `action: "dismiss"` to discard noise.',
   '4. QUANTITATIVE DECISION MAKING: Use `analyze_relationship` (omit `person_id`) to surface `priority_attention_queue` (who to reach out to right now based on exponential decay `freshness_score` and `overdue_ratio`). Before the user meets or buys a gift for someone, call `analyze_relationship` with `person_id` to inspect `cadence.drift_z_score` (unusual silence), `sentiment.energy_state` (`nourishing` vs `cooling_warning` vs `draining`), `signals.preference_changes` (avoid outdated habits), and `depth_and_volatility.missing_dimensions` (suggest conversation topics to fill missing `boundary` or `gift_idea` knowledge).',
 ].join('\n');
 
@@ -185,6 +186,70 @@ export const MCP_TOOLS: McpToolDefinition[] = [
           type: 'string',
           description:
             'Target person ID for deep quantitative diagnosis (`mode: "person_analysis"`). Omit for a global portfolio dashboard and `priority_attention_queue` (`mode: "portfolio_overview"`).',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'manage_disambiguation_item',
+    description:
+      'Inspect and process quarantined items in `disambiguation_queue` (notes that had `confidence < 0.85` or `person_id: null`). ACTIONS: (1) `action: "list"` lists queued items filtered by `status` (`pending` default, `resolved`, `dismissed`, or `all`). (2) `action: "resolve"` or `action: "link"` attributes a pending `queue_id` to a confirmed `person_id`, atomically ingests its timeline event and bitemporal signal into D1 (with optional overrides for `sentiment_score`, `signal_topic`, `signal_value`, `signal_category`), and marks the queue item `resolved`. (3) `action: "dismiss"` marks a pending `queue_id` as `dismissed` without writing to any person profile.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['list', 'resolve', 'link', 'dismiss'],
+          default: 'list',
+          description:
+            'Operation to perform: `list` queue items, `resolve`/`link` a pending item to a `person_id`, or `dismiss` an irrelevant item.',
+        },
+        queue_id: {
+          type: 'string',
+          description:
+            'Target disambiguation queue item ID (e.g., `dq_...`). Required when `action` is `resolve`, `link`, or `dismiss`.',
+        },
+        person_id: {
+          type: 'string',
+          description:
+            'Confirmed target person ID to link the event/signal to. Required when `action` is `resolve` or `link`.',
+        },
+        status: {
+          type: 'string',
+          enum: ['pending', 'resolved', 'dismissed', 'all'],
+          default: 'pending',
+          description: 'Status filter when `action` is `list`. Defaults to `pending`.',
+        },
+        limit: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 100,
+          default: 20,
+          description: 'Maximum items to return when `action` is `list`.',
+        },
+        sentiment_score: {
+          type: 'number',
+          minimum: -1,
+          maximum: 1,
+          description: 'Optional sentiment score (-1.0 to 1.0) to attach when resolving/linking the item.',
+        },
+        signal_topic: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 128,
+          description: 'Optional override or newly extracted snake_case signal_topic when resolving/linking.',
+        },
+        signal_value: {
+          type: 'string',
+          minLength: 1,
+          maxLength: 512,
+          description: 'Optional override or newly extracted signal_value when resolving/linking.',
+        },
+        signal_category: {
+          type: 'string',
+          enum: ['gift_idea', 'preference', 'boundary'],
+          description: 'Optional override for signal_category when resolving/linking.',
         },
       },
       additionalProperties: false,
@@ -1012,6 +1077,209 @@ async function runCreatePersonTool(rawArgs: unknown, env: McpRuntimeEnv) {
   });
 }
 
+const ManageDisambiguationArgsSchema = z.object({
+  action: z.enum(['list', 'resolve', 'link', 'dismiss']).default('list'),
+  queue_id: z.string().trim().min(1).optional(),
+  person_id: z.string().trim().min(1).optional(),
+  status: z.enum(['pending', 'resolved', 'dismissed', 'all']).default('pending'),
+  limit: z.number().int().min(1).max(100).default(20),
+  sentiment_score: z.number().min(-1).max(1).optional(),
+  signal_topic: z.string().trim().min(1).max(128).optional(),
+  signal_value: z.string().trim().min(1).max(512).optional(),
+  signal_category: z.enum(['gift_idea', 'preference', 'boundary']).optional(),
+});
+
+async function runManageDisambiguationTool(rawArgs: unknown, env: McpRuntimeEnv) {
+  const parsed = ManageDisambiguationArgsSchema.safeParse(rawArgs);
+  if (!parsed.success) {
+    return toolResult({ error: 'Invalid arguments', details: parsed.error.flatten() }, true);
+  }
+
+  const db = drizzle(env.DB, { schema });
+  const data = parsed.data;
+
+  if (data.action === 'list') {
+    const query =
+      data.status === 'all'
+        ? db
+            .select()
+            .from(schema.disambiguationQueue)
+            .orderBy(desc(schema.disambiguationQueue.createdAt))
+            .limit(data.limit)
+        : db
+            .select()
+            .from(schema.disambiguationQueue)
+            .where(eq(schema.disambiguationQueue.status, data.status))
+            .orderBy(desc(schema.disambiguationQueue.createdAt))
+            .limit(data.limit);
+
+    const rows = await query;
+    return toolResult({
+      mode: 'list_disambiguation_queue',
+      status_filter: data.status,
+      count: rows.length,
+      items: rows,
+    });
+  }
+
+  if (!data.queue_id) {
+    return toolResult(
+      { error: `queue_id is required when action is '${data.action}'` },
+      true
+    );
+  }
+
+  const [item] = await db
+    .select()
+    .from(schema.disambiguationQueue)
+    .where(eq(schema.disambiguationQueue.id, data.queue_id))
+    .limit(1);
+
+  if (!item) {
+    return toolResult(
+      { status: 'not_found', error: 'Disambiguation queue item not found', queue_id: data.queue_id },
+      true
+    );
+  }
+
+  if (item.status !== 'pending') {
+    return toolResult(
+      {
+        status: 'already_processed',
+        error: `Disambiguation item is already '${item.status}'`,
+        queue_id: item.id,
+        current_status: item.status,
+      },
+      true
+    );
+  }
+
+  if (data.action === 'dismiss') {
+    await db
+      .update(schema.disambiguationQueue)
+      .set({ status: 'dismissed' })
+      .where(eq(schema.disambiguationQueue.id, item.id));
+
+    return toolResult({
+      status: 'dismissed',
+      queue_id: item.id,
+      item: {
+        ...item,
+        status: 'dismissed',
+      },
+    });
+  }
+
+  // action === 'resolve' or 'link'
+  if (!data.person_id) {
+    return toolResult(
+      { error: `person_id is required when action is '${data.action}'`, queue_id: item.id },
+      true
+    );
+  }
+
+  if (!env.PII_TOKEN_KEY && env.ENVIRONMENT !== 'development') {
+    return toolResult(
+      {
+        error: 'Service misconfigured: PII_TOKEN_KEY secret is not set; refusing to store PII tokens.',
+      },
+      true
+    );
+  }
+
+  const [targetPerson] = await db
+    .select({ id: schema.people.id, alias: schema.people.alias })
+    .from(schema.people)
+    .where(eq(schema.people.id, data.person_id))
+    .limit(1);
+
+  if (!targetPerson) {
+    return toolResult(
+      {
+        status: 'rejected',
+        error: 'Target person_id does not exist in people table',
+        queue_id: item.id,
+        person_id: data.person_id,
+      },
+      true
+    );
+  }
+
+  const resolvedTopic = data.signal_topic ?? item.signalTopic ?? undefined;
+  const resolvedValue = data.signal_value ?? item.signalValue ?? undefined;
+  if ((resolvedTopic && !resolvedValue) || (!resolvedTopic && resolvedValue)) {
+    return toolResult(
+      {
+        error: 'signal_topic and signal_value must both be present or both be omitted when resolving',
+        queue_id: item.id,
+      },
+      true
+    );
+  }
+
+  const resolvedCategory = (data.signal_category ??
+    (item.signalCategory === 'gift_idea' ||
+    item.signalCategory === 'preference' ||
+    item.signalCategory === 'boundary'
+      ? item.signalCategory
+      : 'preference')) as 'gift_idea' | 'preference' | 'boundary';
+
+  const resolvedSource = (
+    item.source === 'voice_note' || item.source === 'chat_log' || item.source === 'manual'
+      ? item.source
+      : 'manual'
+  ) as 'voice_note' | 'chat_log' | 'manual';
+
+  // Release the original disambiguation-only idempotency key so resolving an item that originally had
+  // the same person_id (but <0.85 confidence) is not short-circuited as a duplicate of the queued record.
+  await env.DB.prepare(
+    "DELETE FROM idempotency_keys WHERE key = ? AND status = 'routed_to_disambiguation_queue'"
+  )
+    .bind(item.idempotencyKey)
+    .run();
+
+  const ingestPayload = IngestPayloadSchema.parse({
+    person_id: data.person_id,
+    source: resolvedSource,
+    content: item.sanitizedContent,
+    confidence: 1.0,
+    sentiment_score: data.sentiment_score,
+    signal_topic: resolvedTopic,
+    signal_value: resolvedValue,
+    signal_category: resolvedCategory,
+    occurred_at: item.occurredAt,
+  });
+
+  const outcome = await ingestEvent(ingestPayload, new D1IngestStore(env.DB), undefined, {
+    piiTokenKey: env.PII_TOKEN_KEY,
+  });
+
+  if (outcome.status === 'rejected' || outcome.status === 'conflict') {
+    return toolResult(
+      {
+        status: outcome.status,
+        queue_id: item.id,
+        person_id: data.person_id,
+        ingest_outcome: outcome,
+      },
+      true
+    );
+  }
+
+  await db
+    .update(schema.disambiguationQueue)
+    .set({ status: 'resolved' })
+    .where(eq(schema.disambiguationQueue.id, item.id));
+
+  return toolResult({
+    status: 'resolved',
+    action: data.action,
+    queue_id: item.id,
+    person: targetPerson,
+    ingest_outcome: outcome,
+  });
+}
+
 export async function handleMcpRequest(request: Request, env: McpRuntimeEnv): Promise<Response> {
   if (request.method !== 'POST') {
     return new Response(
@@ -1102,6 +1370,8 @@ export async function handleMcpRequest(request: Request, env: McpRuntimeEnv): Pr
           return jsonRpcSuccess(id, await runInsertTool(args, env));
         case 'analyze_relationship':
           return jsonRpcSuccess(id, await runAnalyzeTool(args, env));
+        case 'manage_disambiguation_item':
+          return jsonRpcSuccess(id, await runManageDisambiguationTool(args, env));
         default:
           return jsonRpcError(id, -32602, `Unknown tool: ${toolName}`);
       }
